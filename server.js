@@ -1705,10 +1705,17 @@ async function initializeDatabase() {
 // ========== START SERVER ==========
 
 const PORT = process.env.PORT || 5000;
-app.listen(PORT, () => {
-  console.log(`\n🚀 MOR System Backend Server`);
-  console.log(`📡 Running on http://localhost:${PORT}`);
-  console.log(`🔗 API Base URL: http://localhost:${PORT}/api`);
-  console.log(`💚 Health check: http://localhost:${PORT}/api/health`);
-  console.log(`\n✨ Ready to accept connections!\n`);
-});
+
+// Only listen if not on Vercel/Render serverless
+if (process.env.NODE_ENV !== "production") {
+  app.listen(PORT, () => {
+    console.log(`\n🚀 MOR System Backend Server`);
+    console.log(`📡 Running on http://localhost:${PORT}`);
+    console.log(`🔗 API Base URL: http://localhost:${PORT}/api`);
+    console.log(`💚 Health check: http://localhost:${PORT}/api/health`);
+    console.log(`\n✨ Ready to accept connections!\n`);
+  });
+}
+
+// Export for Vercel/Render serverless deployment
+module.exports = app;
