@@ -18,6 +18,8 @@ app.use(
       "http://127.0.0.1:5500",
       "http://localhost:5500",
       "http://localhost:5000",
+      "https://mor-system-app.vercel.app",
+      "https://mor-system-grhjve1h3-ss-conteh.vercel.app",
     ],
     credentials: true,
   }),
