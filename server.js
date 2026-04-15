@@ -1716,3 +1716,5 @@ if (process.env.NODE_ENV !== "production") {
     console.log(`\n✨ Ready to accept connections!\n`);
   });
 }
+
+module.exports = app;
