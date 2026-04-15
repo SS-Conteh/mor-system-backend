@@ -265,7 +265,7 @@ const roleMiddleware = (...roles) => {
   };
 };
 
-// Profile Photo Upload (Images)
+// Profile Photo Storage
 const profileStorage = new CloudinaryStorage({
   cloudinary: cloudinary,
   params: {
@@ -1520,18 +1520,6 @@ app.put("/api/profile/password", authMiddleware, async (req, res) => {
 // ========== MEDIA ROUTES ==========
 
 // Media Upload (Videos, Audio, Documents, Images)
-const mediaStorage = new CloudinaryStorage({
-  cloudinary: cloudinary,
-  params: (req, file) => ({
-    folder: "mor-system/media",
-    resource_type: "auto",
-  }),
-});
-
-const mediaUpload = multer({
-  storage: mediaStorage,
-  limits: { fileSize: 100 * 1024 * 1024 }, // 100MB
-});
 
 app.get("/api/media", authMiddleware, async (req, res) => {
   try {
