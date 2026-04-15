@@ -6,7 +6,16 @@ const bcrypt = require("bcryptjs");
 const jwt = require("jsonwebtoken");
 const path = require("path");
 const multer = require("multer");
-const fs = require("fs");
+// Cloudinary Setup
+const cloudinary = require("cloudinary").v2;
+const { CloudinaryStorage } = require("multer-storage-cloudinary");
+
+// Configure Cloudinary
+cloudinary.config({
+  cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
+  api_key: process.env.CLOUDINARY_API_KEY,
+  api_secret: process.env.CLOUDINARY_API_SECRET,
+});
 
 const app = express();
 
@@ -14,18 +23,13 @@ const app = express();
 app.use(
   cors({
     origin: [
-      "http://localhost:3000",
-      "http://127.0.0.1:5500",
-      "http://localhost:5500",
-      "http://localhost:5000",
       "https://mor-system-app.vercel.app",
       "https://mor-system-grhjve1h3-ss-conteh.vercel.app",
+      // Add any other Vercel preview URLs
     ],
     credentials: true,
   }),
 );
-app.use(express.json());
-app.use(express.static(path.join(__dirname, "../frontend")));
 
 // ========== DATABASE MODELS ==========
 
@@ -261,26 +265,32 @@ const roleMiddleware = (...roles) => {
   };
 };
 
-// ========== MULTER CONFIGURATION (after authMiddleware) ==========
+// ========== MULTER + CLOUDINARY CONFIG ==========
 
-// Configure multer for file uploads
-const storage = multer.diskStorage({
-  destination: function (req, file, cb) {
-    const uploadDir = path.join(__dirname, "../frontend/uploads");
-    if (!fs.existsSync(uploadDir)) {
-      fs.mkdirSync(uploadDir, { recursive: true });
-    }
-    cb(null, uploadDir);
-  },
-  filename: function (req, file, cb) {
-    const uniqueSuffix = Date.now() + "-" + Math.round(Math.random() * 1e9);
-    cb(null, "profile-" + uniqueSuffix + path.extname(file.originalname));
+// Cloudinary Setup
+const cloudinary = require("cloudinary").v2;
+const { CloudinaryStorage } = require("multer-storage-cloudinary");
+
+// Configure Cloudinary
+cloudinary.config({
+  cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
+  api_key: process.env.CLOUDINARY_API_KEY,
+  api_secret: process.env.CLOUDINARY_API_SECRET,
+});
+
+// Profile Photo Upload (Images)
+const profileStorage = new CloudinaryStorage({
+  cloudinary: cloudinary,
+  params: {
+    folder: "mor-system/profiles",
+    allowed_formats: ["jpg", "jpeg", "png", "gif"],
+    transformation: [{ width: 500, height: 500, crop: "fill" }],
   },
 });
 
 const upload = multer({
-  storage: storage,
-  limits: { fileSize: 5 * 1024 * 1024 }, // 5MB limit
+  storage: profileStorage,
+  limits: { fileSize: 5 * 1024 * 1024 }, // 5MB
   fileFilter: (req, file, cb) => {
     const allowedTypes = /jpeg|jpg|png|gif/;
     const extname = allowedTypes.test(
@@ -290,16 +300,10 @@ const upload = multer({
     if (mimetype && extname) {
       return cb(null, true);
     } else {
-      cb(new Error("Only image files are allowed"));
+      cb(new Error("Only image files (jpg, jpeg, png, gif) are allowed"));
     }
   },
 });
-
-// Serve uploaded files statically
-app.use(
-  "/uploads",
-  express.static(path.join(__dirname, "../frontend/uploads")),
-);
 
 // ========== DATABASE CONNECTION ==========
 console.log("🔌 Connecting to MongoDB Atlas...");
@@ -542,7 +546,6 @@ app.get("/api/auth/verify", authMiddleware, async (req, res) => {
 });
 
 // ========== PROFILE PHOTO UPLOAD ROUTE ==========
-
 app.post(
   "/api/profile/photo",
   authMiddleware,
@@ -553,10 +556,12 @@ app.post(
         return res.status(400).json({ error: "No file uploaded" });
       }
 
-      const photoUrl = `/uploads/${req.file.filename}`;
+      const photoUrl = req.file.path; // Cloudinary full URL
 
       // Update User
-      await User.findByIdAndUpdate(req.user._id, { profilePhoto: photoUrl });
+      await User.findByIdAndUpdate(req.user._id, {
+        profilePhoto: photoUrl,
+      });
 
       // Update Member
       await Member.findOneAndUpdate(
@@ -564,7 +569,10 @@ app.post(
         { profilePhoto: photoUrl },
       );
 
-      res.json({ photoUrl, message: "Profile photo updated successfully" });
+      res.json({
+        photoUrl,
+        message: "Profile photo uploaded successfully",
+      });
     } catch (error) {
       console.error("Upload photo error:", error);
       res.status(500).json({ error: "Server error" });
@@ -1524,26 +1532,19 @@ app.put("/api/profile/password", authMiddleware, async (req, res) => {
 
 // ========== MEDIA ROUTES ==========
 
-const mediaStorage = multer.diskStorage({
-  destination: function (req, file, cb) {
-    const uploadDir = path.join(__dirname, "../frontend/uploads/media");
-    if (!fs.existsSync(uploadDir)) fs.mkdirSync(uploadDir, { recursive: true });
-    cb(null, uploadDir);
-  },
-  filename: function (req, file, cb) {
-    const uniqueSuffix = Date.now() + "-" + Math.round(Math.random() * 1e9);
-    cb(null, "media-" + uniqueSuffix + path.extname(file.originalname));
-  },
-});
-const mediaUpload = multer({
-  storage: mediaStorage,
-  limits: { fileSize: 100 * 1024 * 1024 },
+// Media Upload (Videos, Audio, Documents, Images)
+const mediaStorage = new CloudinaryStorage({
+  cloudinary: cloudinary,
+  params: (req, file) => ({
+    folder: "mor-system/media",
+    resource_type: "auto",
+  }),
 });
 
-app.use(
-  "/uploads/media",
-  express.static(path.join(__dirname, "../frontend/uploads/media")),
-);
+const mediaUpload = multer({
+  storage: mediaStorage,
+  limits: { fileSize: 100 * 1024 * 1024 }, // 100MB
+});
 
 app.get("/api/media", authMiddleware, async (req, res) => {
   try {
@@ -1555,6 +1556,7 @@ app.get("/api/media", authMiddleware, async (req, res) => {
   }
 });
 
+// ========== MEDIA UPLOAD ROUTE ==========
 app.post(
   "/api/media",
   authMiddleware,
@@ -1562,29 +1564,28 @@ app.post(
   async (req, res) => {
     try {
       const { title, type, description } = req.body;
-      if (!title || !type)
-        return res.status(400).json({ error: "Title and type required" });
 
-      let fileInfo = {};
-      if (req.file) {
-        fileInfo = {
-          fileName: req.file.originalname,
-          filePath: `/uploads/media/${req.file.filename}`,
-          fileSize: req.file.size,
-          mimeType: req.file.mimetype,
-        };
+      if (!title || !type || !req.file) {
+        return res.status(400).json({
+          error: "Title, type, and file are required",
+        });
       }
 
       const media = new Media({
         title,
         type,
-        description,
-        ...fileInfo,
+        description: description || "",
+        fileName: req.file.originalname,
+        filePath: req.file.path,
+        fileSize: req.file.size,
+        mimeType: req.file.mimetype,
         uploadedBy: req.user._id,
         uploadedByName: req.user.fullName,
       });
+
       await media.save();
       await logActivity(`uploaded ${type} media: "${title}"`, req.user);
+
       res.status(201).json(media);
     } catch (error) {
       console.error("Upload media error:", error);
@@ -1703,18 +1704,10 @@ async function initializeDatabase() {
 }
 
 // ========== START SERVER ==========
-
 const PORT = process.env.PORT || 5000;
 
-// Only listen if not on Vercel/Render serverless
-if (process.env.NODE_ENV !== "production") {
-  app.listen(PORT, () => {
-    console.log(`\n🚀 MOR System Backend Server`);
-    console.log(`📡 Running on http://localhost:${PORT}`);
-    console.log(`🔗 API Base URL: http://localhost:${PORT}/api`);
-    console.log(`💚 Health check: http://localhost:${PORT}/api/health`);
-    console.log(`\n✨ Ready to accept connections!\n`);
-  });
-}
-
-module.exports = app;
+app.listen(PORT, () => {
+  console.log(`🚀 MOR System Backend running on port ${PORT}`);
+  console.log(`🔗 API: https://your-render-url.onrender.com`);
+  console.log(`💚 Health: https://your-render-url.onrender.com/api/health`);
+});
