@@ -518,6 +518,7 @@ app.post("/api/auth/login", async (req, res) => {
         group: user.group,
         isSteward: user.isSteward,
         membershipStatus: user.membershipStatus,
+        profilePhoto: user.profilePhoto,
       },
     });
   } catch (error) {
