@@ -7,6 +7,15 @@ const jwt = require("jsonwebtoken");
 const path = require("path");
 const multer = require("multer");
 const fs = require("fs");
+const cloudinary = require("cloudinary").v2;
+const { CloudinaryStorage } = require("multer-storage-cloudinary");
+
+// ========== CLOUDINARY CONFIGURATION ==========
+cloudinary.config({
+  cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
+  api_key: process.env.CLOUDINARY_API_KEY,
+  api_secret: process.env.CLOUDINARY_API_SECRET,
+});
 
 const app = express();
 
@@ -263,26 +272,23 @@ const roleMiddleware = (...roles) => {
 
 // ========== MULTER CONFIGURATION (after authMiddleware) ==========
 
-// Configure multer for file uploads
-const storage = multer.diskStorage({
-  destination: function (req, file, cb) {
-    const uploadDir = path.join(__dirname, "../frontend/uploads");
-    if (!fs.existsSync(uploadDir)) {
-      fs.mkdirSync(uploadDir, { recursive: true });
-    }
-    cb(null, uploadDir);
-  },
-  filename: function (req, file, cb) {
-    const uniqueSuffix = Date.now() + "-" + Math.round(Math.random() * 1e9);
-    cb(null, "profile-" + uniqueSuffix + path.extname(file.originalname));
+// Configure multer to upload profile photos directly to Cloudinary
+const profilePhotoStorage = new CloudinaryStorage({
+  cloudinary: cloudinary,
+  params: {
+    folder: "mor-system/profile-photos",
+    allowed_formats: ["jpg", "jpeg", "png", "gif", "webp"],
+    transformation: [
+      { width: 500, height: 500, crop: "fill", gravity: "face" },
+    ],
   },
 });
 
 const upload = multer({
-  storage: storage,
+  storage: profilePhotoStorage,
   limits: { fileSize: 10 * 1024 * 1024 }, // 10MB limit
   fileFilter: (req, file, cb) => {
-    const allowedTypes = /jpeg|jpg|png|gif/;
+    const allowedTypes = /jpeg|jpg|png|gif|webp/;
     const extname = allowedTypes.test(
       path.extname(file.originalname).toLowerCase(),
     );
@@ -295,7 +301,7 @@ const upload = multer({
   },
 });
 
-// Serve uploaded files statically
+// Serve any legacy local uploaded files statically
 app.use(
   "/uploads",
   express.static(path.join(__dirname, "../frontend/uploads")),
@@ -553,7 +559,8 @@ app.post(
         return res.status(400).json({ error: "No file uploaded" });
       }
 
-      const photoUrl = `/uploads/${req.file.filename}`;
+      // Cloudinary returns the full https URL in req.file.path
+      const photoUrl = req.file.path;
 
       // Update User
       await User.findByIdAndUpdate(req.user._id, { profilePhoto: photoUrl });
@@ -1524,22 +1531,25 @@ app.put("/api/profile/password", authMiddleware, async (req, res) => {
 
 // ========== MEDIA ROUTES ==========
 
-const mediaStorage = multer.diskStorage({
-  destination: function (req, file, cb) {
-    const uploadDir = path.join(__dirname, "../frontend/uploads/media");
-    if (!fs.existsSync(uploadDir)) fs.mkdirSync(uploadDir, { recursive: true });
-    cb(null, uploadDir);
-  },
-  filename: function (req, file, cb) {
-    const uniqueSuffix = Date.now() + "-" + Math.round(Math.random() * 1e9);
-    cb(null, "media-" + uniqueSuffix + path.extname(file.originalname));
+const mediaCloudinaryStorage = new CloudinaryStorage({
+  cloudinary: cloudinary,
+  params: (req, file) => {
+    // Choose resource_type based on mime type
+    let resourceType = "auto";
+    return {
+      folder: "mor-system/media",
+      resource_type: resourceType,
+      use_filename: true,
+      unique_filename: true,
+    };
   },
 });
 const mediaUpload = multer({
-  storage: mediaStorage,
+  storage: mediaCloudinaryStorage,
   limits: { fileSize: 100 * 1024 * 1024 },
 });
 
+// Legacy local media files
 app.use(
   "/uploads/media",
   express.static(path.join(__dirname, "../frontend/uploads/media")),
@@ -1569,7 +1579,7 @@ app.post(
       if (req.file) {
         fileInfo = {
           fileName: req.file.originalname,
-          filePath: `/uploads/media/${req.file.filename}`,
+          filePath: req.file.path, // Cloudinary secure URL
           fileSize: req.file.size,
           mimeType: req.file.mimetype,
         };
