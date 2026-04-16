@@ -8,8 +8,6 @@ const path = require("path");
 const multer = require("multer");
 const fs = require("fs");
 const cloudinary = require("cloudinary").v2;
-const { CloudinaryStorage } = require("multer-storage-cloudinary");
-
 // ========== CLOUDINARY CONFIGURATION ==========
 cloudinary.config({
   cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
@@ -272,20 +270,9 @@ const roleMiddleware = (...roles) => {
 
 // ========== MULTER CONFIGURATION (after authMiddleware) ==========
 
-// Configure multer to upload profile photos directly to Cloudinary
-const profilePhotoStorage = new CloudinaryStorage({
-  cloudinary: cloudinary,
-  params: {
-    folder: "mor-system/profile-photos",
-    allowed_formats: ["jpg", "jpeg", "png", "gif", "webp"],
-    transformation: [
-      { width: 500, height: 500, crop: "fill", gravity: "face" },
-    ],
-  },
-});
-
+// Configure multer to use memory storage — file buffer sent directly to Cloudinary
 const upload = multer({
-  storage: profilePhotoStorage,
+  storage: multer.memoryStorage(),
   limits: { fileSize: 10 * 1024 * 1024 }, // 10MB limit
   fileFilter: (req, file, cb) => {
     const allowedTypes = /jpeg|jpg|png|gif|webp/;
@@ -559,8 +546,22 @@ app.post(
         return res.status(400).json({ error: "No file uploaded" });
       }
 
-      // Cloudinary returns the full https URL in req.file.path
-      const photoUrl = req.file.path;
+      // Upload buffer directly to Cloudinary using upload_stream
+      const photoUrl = await new Promise((resolve, reject) => {
+        const stream = cloudinary.uploader.upload_stream(
+          {
+            folder: "mor-system/profile-photos",
+            transformation: [
+              { width: 500, height: 500, crop: "fill", gravity: "face" },
+            ],
+          },
+          (error, result) => {
+            if (error) return reject(error);
+            resolve(result.secure_url);
+          },
+        );
+        stream.end(req.file.buffer);
+      });
 
       // Update User
       await User.findByIdAndUpdate(req.user._id, { profilePhoto: photoUrl });
@@ -1531,21 +1532,9 @@ app.put("/api/profile/password", authMiddleware, async (req, res) => {
 
 // ========== MEDIA ROUTES ==========
 
-const mediaCloudinaryStorage = new CloudinaryStorage({
-  cloudinary: cloudinary,
-  params: (req, file) => {
-    // Choose resource_type based on mime type
-    let resourceType = "auto";
-    return {
-      folder: "mor-system/media",
-      resource_type: resourceType,
-      use_filename: true,
-      unique_filename: true,
-    };
-  },
-});
+// Media upload uses memory storage — buffer streamed to Cloudinary in the route
 const mediaUpload = multer({
-  storage: mediaCloudinaryStorage,
+  storage: multer.memoryStorage(),
   limits: { fileSize: 100 * 1024 * 1024 },
 });
 
@@ -1577,9 +1566,20 @@ app.post(
 
       let fileInfo = {};
       if (req.file) {
+        // Upload buffer to Cloudinary
+        const cloudinaryUrl = await new Promise((resolve, reject) => {
+          const stream = cloudinary.uploader.upload_stream(
+            { folder: "mor-system/media", resource_type: "auto" },
+            (error, result) => {
+              if (error) return reject(error);
+              resolve(result.secure_url);
+            },
+          );
+          stream.end(req.file.buffer);
+        });
         fileInfo = {
           fileName: req.file.originalname,
-          filePath: req.file.path, // Cloudinary secure URL
+          filePath: cloudinaryUrl,
           fileSize: req.file.size,
           mimeType: req.file.mimetype,
         };
