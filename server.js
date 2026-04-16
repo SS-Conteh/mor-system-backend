@@ -280,7 +280,7 @@ const storage = multer.diskStorage({
 
 const upload = multer({
   storage: storage,
-  limits: { fileSize: 5 * 1024 * 1024 }, // 5MB limit
+  limits: { fileSize: 10 * 1024 * 1024 }, // 10MB limit
   fileFilter: (req, file, cb) => {
     const allowedTypes = /jpeg|jpg|png|gif/;
     const extname = allowedTypes.test(
@@ -1714,8 +1714,9 @@ app.listen(PORT, "0.0.0.0", () => {
   console.log(
     `💚 Health check: https://mor-system-backend.onrender.com/api/health`,
   );
-  console.log(`\n✨ Ready to accept connections!\n`);
+  console.log(`📡 Server: http://localhost:5000`);
 });
+console.log(`\n✨ Ready to accept connections!\n`);
 
 // Export for serverless platforms (optional)
 module.exports = app;
