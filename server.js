@@ -586,7 +586,10 @@ app.get("/api/members", authMiddleware, async (req, res) => {
   try {
     const { group, status, search, steward, cbsLocation } = req.query;
     let query = {};
-    if (req.user.role === "Group Leader" && req.user.group)
+    // cbsOnly=true signals a CBS register fetch — skip group filter so ALL members
+    // at that CBS location show up, even those from other groups.
+    const cbsOnly = req.query.cbsOnly === "true";
+    if (!cbsOnly && req.user.role === "Group Leader" && req.user.group)
       query.group = req.user.group;
     if (group && group !== "All Groups") query.group = group;
     if (status && status !== "All Statuses") query.membershipStatus = status;
