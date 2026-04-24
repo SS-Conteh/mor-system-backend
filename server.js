@@ -1135,7 +1135,10 @@ app.post("/api/attendance", authMiddleware, async (req, res) => {
     const attendance = new Attendance({
       type,
       // ── FIX #5: Don't store "all" as group name — use null instead ──
-      group: group && group !== "all" && group !== "" ? group : null,
+      group:
+        group && group !== "all" && group !== "All" && group !== ""
+          ? group
+          : null,
       cbsLocation: type === "cbs" ? cbsLocation : undefined,
       branch: branch || req.user.branch || null,
       date: new Date(date),
