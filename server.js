@@ -1093,10 +1093,14 @@ app.get("/api/attendance", authMiddleware, async (req, res) => {
     const { type, group, cbsLocation, date, branch } = req.query;
     let query = {};
     if (type) query.type = type;
-    // ── FIX #5: For fellowship/evangelism, empty group means "all groups" ──
     if (group && group !== "" && group !== "null") query.group = group;
     if (cbsLocation) query.cbsLocation = cbsLocation;
-    if (branch) query.branch = branch;
+    if (branch) {
+      query.branch = branch;
+    } else if (req.user.role === "Branch Head Shepherd" && req.user.branch) {
+      // Auto-scope attendance to Branch Head Shepherd's branch
+      query.branch = req.user.branch;
+    }
     if (date) {
       const start = new Date(date);
       start.setHours(0, 0, 0, 0);
@@ -1244,10 +1248,28 @@ app.get("/api/dashboard/stats", authMiddleware, async (req, res) => {
 });
 
 // ========== GROUPS ROUTES ==========
-app.get("/api/groups", async (req, res) => {
+// Optional auth middleware — reads token if present, allows public access if not
+const optionalAuth = async (req, res, next) => {
+  try {
+    const token = req.header("Authorization")?.replace("Bearer ", "");
+    if (token) {
+      const decoded = jwt.verify(token, process.env.JWT_SECRET);
+      req.user = await User.findById(decoded.userId).select("-password");
+    }
+  } catch (_) {}
+  next();
+};
+
+app.get("/api/groups", optionalAuth, async (req, res) => {
   try {
     const query = {};
-    if (req.query.branch) query.branch = req.query.branch;
+    if (req.query.branch) {
+      // Explicit branch param takes priority (used by signup and index.html filters)
+      query.branch = req.query.branch;
+    } else if (req.user && req.user.role === "Branch Head Shepherd") {
+      // Authenticated Branch Head Shepherd with no explicit param — scope to their branch
+      query.branch = req.user.branch;
+    }
     const groups = await Group.find(query);
     const memberQuery = query.branch ? { branch: query.branch } : {};
     const members = await Member.find(memberQuery);
