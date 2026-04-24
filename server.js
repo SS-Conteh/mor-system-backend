@@ -8,6 +8,9 @@ const path = require("path");
 const multer = require("multer");
 const fs = require("fs");
 const cloudinary = require("cloudinary").v2;
+const crypto = require("crypto");
+const cron = require("node-cron");
+
 // ========== CLOUDINARY CONFIGURATION ==========
 cloudinary.config({
   cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
@@ -27,6 +30,8 @@ app.use(
       "http://localhost:5000",
       "https://mor-system-app.vercel.app",
       "https://mor-system-grhjve1h3-ss-conteh.vercel.app",
+      "http://localhost",
+      "capacitor://localhost",
     ],
     credentials: true,
   }),
@@ -36,6 +41,16 @@ app.use(express.static(path.join(__dirname, "../frontend")));
 
 // ========== DATABASE MODELS ==========
 
+const MEMBERSHIP_STATUSES = [
+  "First Timer",
+  "Inconsistent",
+  "Semi-Consistent",
+  "Consistent",
+  "Intense Leader",
+  "Discipleship",
+  "Leader",
+];
+
 // User Model
 const UserSchema = new mongoose.Schema({
   fullName: { type: String, required: true },
@@ -43,9 +58,16 @@ const UserSchema = new mongoose.Schema({
   password: { type: String, required: true },
   role: {
     type: String,
-    enum: ["Head Shepherd", "Group Leader", "Member", "System Admin"],
+    enum: [
+      "Head Shepherd",
+      "Branch Head Shepherd",
+      "Group Leader",
+      "Member",
+      "System Admin",
+    ],
     default: "Member",
   },
+  branch: { type: String, default: "MOR Head Quarter" },
   group: { type: String, default: null },
   profilePhoto: { type: String, default: "" },
   dateOfBirth: Date,
@@ -57,16 +79,7 @@ const UserSchema = new mongoose.Schema({
   cbsLocation: String,
   membershipStatus: {
     type: String,
-    enum: [
-      "First Timer",
-      "Inconsistent",
-      "Semi-Consistent",
-      "Consistent",
-      "Potential Leader",
-      "Intense Leader",
-      "Discipleship",
-      "Leader",
-    ],
+    enum: MEMBERSHIP_STATUSES,
     default: "First Timer",
   },
   isSteward: { type: Boolean, default: false },
@@ -76,6 +89,14 @@ const UserSchema = new mongoose.Schema({
   isGroupLeader: { type: Boolean, default: false },
   isHeadShepherd: { type: Boolean, default: false },
   isSystemAdmin: { type: Boolean, default: false },
+  isBranchShepherd: { type: Boolean, default: false },
+  assignedMembers: [{ type: mongoose.Schema.Types.ObjectId, ref: "Member" }],
+  assignedTo: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: "User",
+    default: null,
+  },
+  assignedToName: { type: String, default: null },
   createdAt: { type: Date, default: Date.now },
   lastLogin: Date,
 });
@@ -92,27 +113,32 @@ const MemberSchema = new mongoose.Schema({
   occupation: String,
   school: String,
   church: String,
+  branch: { type: String, default: "MOR Head Quarter" },
   group: { type: String, default: null },
   cbsLocation: String,
   membershipStatus: {
     type: String,
-    enum: [
-      "First Timer",
-      "Inconsistent",
-      "Semi-Consistent",
-      "Consistent",
-      "Potential Leader",
-      "Intense Leader",
-      "Discipleship",
-      "Leader",
-    ],
+    enum: MEMBERSHIP_STATUSES,
     default: "First Timer",
+  },
+  // ── FIX #3: Added role field to Member model ──
+  role: {
+    type: String,
+    enum: ["Head Shepherd", "Branch Head Shepherd", "Group Leader", "Member"],
+    default: "Member",
   },
   isSteward: { type: Boolean, default: false },
   stewardSince: Date,
   isCBSLeader: { type: Boolean, default: false },
   assignedCBSLocation: { type: String, default: null },
   isGroupLeader: { type: Boolean, default: false },
+  isBranchShepherd: { type: Boolean, default: false },
+  assignedTo: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: "User",
+    default: null,
+  },
+  assignedToName: { type: String, default: null },
   addedBy: { type: mongoose.Schema.Types.ObjectId, ref: "User" },
   addedByName: String,
   createdAt: { type: Date, default: Date.now },
@@ -126,7 +152,8 @@ const AttendanceSchema = new mongoose.Schema({
     enum: ["fellowship", "cbs", "evangelism", "seminar"],
     required: true,
   },
-  group: String,
+  branch: { type: String, default: null },
+  group: { type: String, default: null },
   cbsLocation: String,
   date: { type: Date, required: true },
   records: [
@@ -135,6 +162,7 @@ const AttendanceSchema = new mongoose.Schema({
       memberName: String,
       status: { type: String, enum: ["present", "absent"], default: "absent" },
       checkInTime: Date,
+      scanMethod: { type: String, enum: ["manual", "qr"], default: "manual" },
     },
   ],
   stats: { total: Number, present: Number, absent: Number, percentage: Number },
@@ -145,11 +173,8 @@ const AttendanceSchema = new mongoose.Schema({
 
 // Group Model
 const GroupSchema = new mongoose.Schema({
-  name: {
-    type: String,
-    required: true,
-    unique: true,
-  },
+  name: { type: String, required: true, unique: true },
+  branch: { type: String, default: "MOR Head Quarter" },
   leader: { type: mongoose.Schema.Types.ObjectId, ref: "User" },
   leaderName: String,
   leaderPhone: String,
@@ -159,7 +184,6 @@ const GroupSchema = new mongoose.Schema({
   memberCount: { type: Number, default: 0 },
   stewardCount: { type: Number, default: 0 },
   intenseLeaderCount: { type: Number, default: 0 },
-  potentialLeaderCount: { type: Number, default: 0 },
   consistentCount: { type: Number, default: 0 },
   semiConsistentCount: { type: Number, default: 0 },
   inconsistentCount: { type: Number, default: 0 },
@@ -173,6 +197,7 @@ const GroupSchema = new mongoose.Schema({
 // CBS Location Model
 const CBSLocationSchema = new mongoose.Schema({
   name: { type: String, required: true, unique: true },
+  branch: { type: String, default: "MOR Head Quarter" },
   leader: { type: mongoose.Schema.Types.ObjectId, ref: "User" },
   leaderName: String,
   leaderPhone: String,
@@ -186,16 +211,153 @@ const CBSLocationSchema = new mongoose.Schema({
   createdAt: { type: Date, default: Date.now },
 });
 
+// Branch Model
+const BranchSchema = new mongoose.Schema({
+  name: { type: String, required: true, unique: true },
+  headShepherd: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: "User",
+    default: null,
+  },
+  headShepherdName: { type: String, default: null },
+  headShepherdPhone: { type: String, default: null },
+  memberCount: { type: Number, default: 0 },
+  groupCount: { type: Number, default: 0 },
+  description: String,
+  isActive: { type: Boolean, default: true },
+  createdAt: { type: Date, default: Date.now },
+});
+
+// QR Session Model
+const QRSessionSchema = new mongoose.Schema({
+  token: { type: String, required: true, unique: true },
+  type: {
+    type: String,
+    enum: ["fellowship", "cbs", "evangelism"],
+    required: true,
+  },
+  branch: { type: String, default: "MOR Head Quarter" },
+  group: String,
+  cbsLocation: String,
+  date: { type: Date, required: true },
+  expiresAt: { type: Date, required: true },
+  createdBy: { type: mongoose.Schema.Types.ObjectId, ref: "User" },
+  createdByName: String,
+  isActive: { type: Boolean, default: true },
+  scans: [
+    {
+      memberId: { type: mongoose.Schema.Types.ObjectId, ref: "Member" },
+      memberName: String,
+      group: String,
+      membershipStatus: String,
+      scanTime: { type: Date, default: Date.now },
+      timing: { type: String, enum: ["on_time", "late"], default: "on_time" },
+    },
+  ],
+  createdAt: { type: Date, default: Date.now },
+});
+
+// Follow-up Assignment Model
+const AssignmentSchema = new mongoose.Schema({
+  assignedBy: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: "User",
+    required: true,
+  },
+  assignedByName: String,
+  assignedTo: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: "User",
+    required: true,
+  },
+  assignedToName: String,
+  assignedToRole: String,
+  assignedToStatus: String,
+  member: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: "Member",
+    required: true,
+  },
+  memberName: String,
+  memberPhone: String,
+  memberStatus: String,
+  group: String,
+  branch: { type: String, default: "MOR Head Quarter" },
+  notes: String,
+  createdAt: { type: Date, default: Date.now },
+});
+
+// Report Model
+const ReportSchema = new mongoose.Schema({
+  title: { type: String, required: true },
+  type: {
+    type: String,
+    enum: ["weekly", "monthly", "quarterly", "manual", "inconsistency", "auto"],
+    required: true,
+  },
+  scope: {
+    type: String,
+    enum: ["general", "group", "branch"],
+    default: "general",
+  },
+  targetGroup: String,
+  targetBranch: String,
+  sentTo: [
+    { userId: mongoose.Schema.Types.ObjectId, name: String, role: String },
+  ],
+  sentBy: { type: mongoose.Schema.Types.ObjectId, ref: "User" },
+  sentByName: String,
+  body: String,
+  data: mongoose.Schema.Types.Mixed,
+  period: { start: Date, end: Date },
+  isRead: { type: Boolean, default: false },
+  readBy: [{ type: mongoose.Schema.Types.ObjectId, ref: "User" }],
+  createdAt: { type: Date, default: Date.now },
+});
+
+// Notification Schedule Model
+const NotifScheduleSchema = new mongoose.Schema({
+  title: { type: String, required: true },
+  message: { type: String, required: true },
+  activityType: {
+    type: String,
+    enum: ["fellowship", "cbs", "evangelism", "seminar", "camp", "general"],
+    default: "general",
+  },
+  schedule: {
+    dayOfWeek: Number,
+    weekPattern: {
+      type: String,
+      enum: ["every", "first", "second", "third", "fourth", "last"],
+      default: "every",
+    },
+    month: Number,
+    hourUTC: { type: Number, default: 8 },
+  },
+  isActive: { type: Boolean, default: true },
+  targetScope: {
+    type: String,
+    enum: ["all", "group", "branch"],
+    default: "all",
+  },
+  targetGroup: String,
+  targetBranch: String,
+  lastSent: Date,
+  createdBy: { type: mongoose.Schema.Types.ObjectId, ref: "User" },
+  createdAt: { type: Date, default: Date.now },
+});
+
 // Notification Model
 const NotificationSchema = new mongoose.Schema({
   title: { type: String, required: true },
   message: { type: String, required: true },
   type: {
     type: String,
-    enum: ["general", "group", "personal"],
+    enum: ["general", "group", "personal", "report", "reminder"],
     default: "general",
   },
   targetGroup: String,
+  targetBranch: String,
   targetUser: { type: mongoose.Schema.Types.ObjectId, ref: "User" },
   sentBy: { type: mongoose.Schema.Types.ObjectId, ref: "User" },
   sentByName: String,
@@ -240,12 +402,16 @@ const Member = mongoose.model("Member", MemberSchema);
 const Attendance = mongoose.model("Attendance", AttendanceSchema);
 const Group = mongoose.model("Group", GroupSchema);
 const CBSLocation = mongoose.model("CBSLocation", CBSLocationSchema);
+const Branch = mongoose.model("Branch", BranchSchema);
+const QRSession = mongoose.model("QRSession", QRSessionSchema);
+const Assignment = mongoose.model("Assignment", AssignmentSchema);
+const Report = mongoose.model("Report", ReportSchema);
+const NotifSchedule = mongoose.model("NotifSchedule", NotifScheduleSchema);
 const Notification = mongoose.model("Notification", NotificationSchema);
 const ActivityLog = mongoose.model("ActivityLog", ActivityLogSchema);
 const Media = mongoose.model("Media", MediaSchema);
 
 // ========== AUTH MIDDLEWARE ==========
-
 const authMiddleware = async (req, res, next) => {
   try {
     const token = req.header("Authorization")?.replace("Bearer ", "");
@@ -260,83 +426,51 @@ const authMiddleware = async (req, res, next) => {
   }
 };
 
-const roleMiddleware = (...roles) => {
-  return (req, res, next) => {
+const roleMiddleware =
+  (...roles) =>
+  (req, res, next) => {
     if (!roles.includes(req.user.role))
       return res.status(403).json({ error: "Access denied" });
     next();
   };
-};
 
-// ========== MULTER CONFIGURATION (after authMiddleware) ==========
-
-// Configure multer to use memory storage — file buffer sent directly to Cloudinary
+// ========== MULTER CONFIGURATION ==========
 const upload = multer({
   storage: multer.memoryStorage(),
-  limits: { fileSize: 10 * 1024 * 1024 }, // 10MB limit
+  limits: { fileSize: 10 * 1024 * 1024 },
   fileFilter: (req, file, cb) => {
-    const allowedTypes = /jpeg|jpg|png|gif|webp/;
-    const extname = allowedTypes.test(
-      path.extname(file.originalname).toLowerCase(),
-    );
-    const mimetype = allowedTypes.test(file.mimetype);
-    if (mimetype && extname) {
-      return cb(null, true);
-    } else {
-      cb(new Error("Only image files are allowed"));
-    }
+    if (/jpeg|jpg|png|gif|webp/.test(file.mimetype)) return cb(null, true);
+    cb(new Error("Only image files are allowed"));
   },
 });
+const mediaUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 100 * 1024 * 1024 },
+});
 
-// Serve any legacy local uploaded files statically
 app.use(
   "/uploads",
   express.static(path.join(__dirname, "../frontend/uploads")),
 );
+app.use(
+  "/uploads/media",
+  express.static(path.join(__dirname, "../frontend/uploads/media")),
+);
 
 // ========== DATABASE CONNECTION ==========
 console.log("🔌 Connecting to MongoDB Atlas...");
-
 mongoose
   .connect(process.env.MONGODB_URI)
   .then(() => {
-    console.log("✅ Successfully connected to MongoDB Atlas!");
+    console.log("✅ Connected to MongoDB Atlas!");
     initializeDatabase();
   })
   .catch((err) => {
-    console.error("❌ MongoDB connection error:", err.message);
+    console.error("❌ MongoDB error:", err.message);
     process.exit(1);
   });
 
-// ========== API ROUTES ==========
-
-// Serve role-specific pages
-app.get("/", (req, res) => {
-  res.sendFile(path.join(__dirname, "../frontend/index.html"));
-});
-app.get("/group-leader", (req, res) => {
-  res.sendFile(path.join(__dirname, "../frontend/group-leader.html"));
-});
-app.get("/member", (req, res) => {
-  res.sendFile(path.join(__dirname, "../frontend/member.html"));
-});
-
-// API Info
-app.get("/api", (req, res) => {
-  res.json({ name: "MOR System API", version: "1.0.0", status: "running" });
-});
-
-// Health Check
-app.get("/api/health", (req, res) => {
-  res.json({
-    status: "OK",
-    timestamp: new Date(),
-    database:
-      mongoose.connection.readyState === 1 ? "Connected" : "Disconnected",
-  });
-});
-
-// ========== ACTIVITY LOG HELPER ==========
+// ========== HELPERS ==========
 async function logActivity(action, user, details = "") {
   try {
     await ActivityLog.create({
@@ -346,18 +480,92 @@ async function logActivity(action, user, details = "") {
       userRole: user?.role || "System",
       details,
     });
-  } catch (e) {
-    /* non-critical */
-  }
+  } catch (e) {}
 }
 
-// ========== AUTH ROUTES ==========
+async function sendSystemNotification(
+  title,
+  message,
+  type = "general",
+  targetGroup = null,
+  targetUser = null,
+) {
+  try {
+    await Notification.create({
+      title,
+      message,
+      type,
+      targetGroup: targetGroup || undefined,
+      targetUser: targetUser || undefined,
+      sentByName: "MOR System",
+      sentByRole: "System",
+    });
+  } catch (e) {}
+}
 
-// Register a member as a full user+member account (by Head Shepherd/Group Leader)
+// QR timing helper
+const QR_CUTOFFS = {
+  fellowship: { h: 15, m: 30 },
+  cbs: { h: 20, m: 0 },
+  evangelism: { h: 21, m: 0 },
+};
+function getQRExpiry(type, dateStr) {
+  const d = new Date(dateStr);
+  const cut = QR_CUTOFFS[type] || { h: 23, m: 59 };
+  d.setHours(cut.h, cut.m, 0, 0);
+  return d;
+}
+function isOnTime(type, scanTime) {
+  const t = new Date(scanTime);
+  const h = t.getHours(),
+    m = t.getMinutes();
+  const mins = h * 60 + m;
+  if (type === "fellowship") return mins <= 13 * 60 + 45;
+  if (type === "cbs") return mins <= 18 * 60 + 20;
+  return true;
+}
+
+// ========== SERVE PAGES ==========
+app.get("/", (req, res) =>
+  res.sendFile(path.join(__dirname, "../frontend/index.html")),
+);
+app.get("/group-leader", (req, res) =>
+  res.sendFile(path.join(__dirname, "../frontend/group-leader.html")),
+);
+app.get("/member", (req, res) =>
+  res.sendFile(path.join(__dirname, "../frontend/member.html")),
+);
+app.get("/qr-scan", (req, res) =>
+  res.sendFile(path.join(__dirname, "../frontend/qr-scan.html")),
+);
+app.get("/branch", (req, res) =>
+  res.sendFile(path.join(__dirname, "../frontend/branch.html")),
+);
+app.get("/branch.html", (req, res) =>
+  res.sendFile(path.join(__dirname, "../frontend/branch.html")),
+);
+app.get("/api", (req, res) =>
+  res.json({ name: "MOR System API", version: "2.0.0", status: "running" }),
+);
+app.get("/api/health", (req, res) =>
+  res.json({
+    status: "OK",
+    timestamp: new Date(),
+    database:
+      mongoose.connection.readyState === 1 ? "Connected" : "Disconnected",
+  }),
+);
+
+// ========== AUTH ROUTES ==========
 app.post(
   "/api/auth/register-member",
   authMiddleware,
-  roleMiddleware("Head Shepherd", "Group Leader", "System Admin"),
+  roleMiddleware(
+    "Head Shepherd",
+    "Branch Head Shepherd",
+    "Group Leader",
+    "System Admin",
+  ),
   async (req, res) => {
     try {
       const {
@@ -366,38 +574,47 @@ app.post(
         password,
         group,
         membershipStatus,
+        branch,
+        role,
         ...otherFields
       } = req.body;
       if (!fullName || !phoneNumber || !password)
         return res
           .status(400)
           .json({ error: "fullName, phoneNumber and password are required" });
-
-      const existingUser = await User.findOne({ phoneNumber });
-      if (existingUser)
+      if (await User.findOne({ phoneNumber }))
         return res
           .status(400)
           .json({ error: "Phone number already registered" });
-
       const hashedPassword = await bcrypt.hash(password, 10);
+      const userBranch = branch || req.user.branch || "MOR Head Quarter";
+
+      // Determine user role from member role field
+      let userRole = "Member";
+      if (role === "Head Shepherd") userRole = "Head Shepherd";
+      else if (role === "Branch Head Shepherd")
+        userRole = "Branch Head Shepherd";
+      else if (role === "Group Leader") userRole = "Group Leader";
+
       const user = new User({
         fullName,
         phoneNumber,
         password: hashedPassword,
-        role: "Member",
+        role: userRole,
+        branch: userBranch,
         group: group || null,
         membershipStatus: membershipStatus || "First Timer",
         ...otherFields,
       });
       await user.save();
-
-      // Check if member record already exists (by phone)
       let member = await Member.findOne({ phoneNumber });
       if (!member) {
         member = new Member({
           fullName,
           phoneNumber,
+          branch: userBranch,
           group: group || null,
+          role: role || "Member",
           membershipStatus: membershipStatus || "First Timer",
           ...otherFields,
           addedBy: req.user._id,
@@ -405,23 +622,16 @@ app.post(
         });
         await member.save();
       }
-
-      if (member.group && member.group !== "General") {
+      if (member.group)
         await Group.findOneAndUpdate(
           { name: member.group },
           { $inc: { memberCount: 1 } },
         );
-      }
-
-      await logActivity(
-        `added new member ${fullName} with account access`,
-        req.user,
-      );
+      await logActivity(`registered member ${fullName} with account`, req.user);
       res
         .status(201)
         .json({ message: "Member registered successfully", member });
     } catch (error) {
-      console.error("Register member error:", error);
       res.status(500).json({ error: error.message || "Server error" });
     }
   },
@@ -429,29 +639,28 @@ app.post(
 
 app.post("/api/auth/register", async (req, res) => {
   try {
-    const { fullName, phoneNumber, password, group, ...otherFields } = req.body;
-    const existingUser = await User.findOne({ phoneNumber });
-    if (existingUser)
+    const { fullName, phoneNumber, password, group, branch, ...otherFields } =
+      req.body;
+    if (await User.findOne({ phoneNumber }))
       return res.status(400).json({ error: "Phone number already registered" });
-
     const userCount = await User.countDocuments();
     let role = "Member";
     if (userCount === 0) role = "Head Shepherd";
-
     const hashedPassword = await bcrypt.hash(password, 10);
     const user = new User({
       fullName,
       phoneNumber,
       password: hashedPassword,
       role,
+      branch: branch || "MOR Head Quarter",
       group: group || null,
       ...otherFields,
     });
     await user.save();
-
     const member = new Member({
       fullName,
       phoneNumber,
+      branch: branch || "MOR Head Quarter",
       group: group || null,
       membershipStatus: "First Timer",
       ...otherFields,
@@ -459,7 +668,6 @@ app.post("/api/auth/register", async (req, res) => {
       addedByName: user.fullName,
     });
     await member.save();
-
     const token = jwt.sign(
       { userId: user._id, role: user.role },
       process.env.JWT_SECRET,
@@ -474,10 +682,10 @@ app.post("/api/auth/register", async (req, res) => {
         phoneNumber: user.phoneNumber,
         role: user.role,
         group: user.group,
+        branch: user.branch,
       },
     });
   } catch (error) {
-    console.error("Registration error:", error);
     res.status(500).json({ error: "Server error" });
   }
 });
@@ -487,10 +695,8 @@ app.post("/api/auth/login", async (req, res) => {
     const { phoneNumber, password } = req.body;
     const user = await User.findOne({ phoneNumber });
     if (!user) return res.status(401).json({ error: "Invalid credentials" });
-
-    const isValid = await bcrypt.compare(password, user.password);
-    if (!isValid) return res.status(401).json({ error: "Invalid credentials" });
-
+    if (!(await bcrypt.compare(password, user.password)))
+      return res.status(401).json({ error: "Invalid credentials" });
     const token = jwt.sign(
       { userId: user._id, role: user.role },
       process.env.JWT_SECRET,
@@ -498,8 +704,7 @@ app.post("/api/auth/login", async (req, res) => {
     );
     user.lastLogin = new Date();
     await user.save();
-    await logActivity(`logged in`, user);
-
+    await logActivity("logged in", user);
     res.json({
       message: "Login successful",
       token,
@@ -509,44 +714,40 @@ app.post("/api/auth/login", async (req, res) => {
         phoneNumber: user.phoneNumber,
         role: user.role,
         group: user.group,
+        branch: user.branch,
         isSteward: user.isSteward,
         membershipStatus: user.membershipStatus,
+        isBranchShepherd: user.isBranchShepherd,
+        isCBSLeader: user.isCBSLeader,
+        assignedCBSLocation: user.assignedCBSLocation,
+        isGroupLeader: user.isGroupLeader,
       },
     });
   } catch (error) {
-    console.error("Login error:", error);
     res.status(500).json({ error: "Server error" });
   }
 });
 
 app.get("/api/auth/verify", authMiddleware, async (req, res) => {
-  try {
-    res.json({
-      valid: true,
-      user: {
-        id: req.user._id,
-        role: req.user.role,
-        fullName: req.user.fullName,
-      },
-    });
-  } catch (error) {
-    res.status(401).json({ valid: false, error: "Invalid token" });
-  }
+  res.json({
+    valid: true,
+    user: {
+      id: req.user._id,
+      role: req.user.role,
+      fullName: req.user.fullName,
+      branch: req.user.branch,
+    },
+  });
 });
 
-// ========== PROFILE PHOTO UPLOAD ROUTE ==========
-
+// ========== PROFILE ROUTES ==========
 app.post(
   "/api/profile/photo",
   authMiddleware,
   upload.single("photo"),
   async (req, res) => {
     try {
-      if (!req.file) {
-        return res.status(400).json({ error: "No file uploaded" });
-      }
-
-      // Upload buffer directly to Cloudinary using upload_stream
+      if (!req.file) return res.status(400).json({ error: "No file uploaded" });
       const photoUrl = await new Promise((resolve, reject) => {
         const stream = cloudinary.uploader.upload_stream(
           {
@@ -562,50 +763,137 @@ app.post(
         );
         stream.end(req.file.buffer);
       });
-
-      // Update User
       await User.findByIdAndUpdate(req.user._id, { profilePhoto: photoUrl });
-
-      // Update Member
       await Member.findOneAndUpdate(
         { phoneNumber: req.user.phoneNumber },
         { profilePhoto: photoUrl },
       );
-
       res.json({ photoUrl, message: "Profile photo updated successfully" });
     } catch (error) {
-      console.error("Upload photo error:", error);
       res.status(500).json({ error: "Server error" });
     }
   },
 );
 
-// ========== MEMBER ROUTES ==========
+app.get("/api/profile", authMiddleware, async (req, res) => {
+  try {
+    const user = await User.findById(req.user._id).select("-password");
+    const member = await Member.findOne({ phoneNumber: req.user.phoneNumber });
+    const profile = {
+      ...(member ? member.toObject() : {}),
+      fullName: user.fullName,
+      phoneNumber: user.phoneNumber,
+      role: user.role,
+      branch: user.branch || member?.branch || "MOR Head Quarter",
+      profilePhoto: member?.profilePhoto || user.profilePhoto || "",
+      dateOfBirth: member?.dateOfBirth || user.dateOfBirth,
+      gender: member?.gender || user.gender,
+      address: member?.address || user.address,
+      occupation: member?.occupation || user.occupation,
+      school: member?.school || user.school,
+      church: member?.church || user.church,
+      cbsLocation: member?.cbsLocation || user.cbsLocation,
+      group: member?.group || user.group,
+      membershipStatus: member?.membershipStatus || user.membershipStatus,
+      isSteward: member?.isSteward || user.isSteward || false,
+      stewardSince: member?.stewardSince || user.stewardSince,
+      isCBSLeader: user.isCBSLeader || false,
+      assignedCBSLocation: user.assignedCBSLocation || null,
+      isBranchShepherd: user.isBranchShepherd || false,
+      assignedTo: member?.assignedTo || null,
+      assignedToName: member?.assignedToName || null,
+    };
+    res.json(profile);
+  } catch (error) {
+    res.status(500).json({ error: "Server error" });
+  }
+});
 
+app.put("/api/profile", authMiddleware, async (req, res) => {
+  try {
+    const {
+      fullName,
+      address,
+      occupation,
+      school,
+      church,
+      profilePhoto,
+      dateOfBirth,
+      gender,
+      cbsLocation,
+    } = req.body;
+    const user = await User.findById(req.user._id);
+    if (!user) return res.status(404).json({ error: "User not found" });
+    if (fullName) user.fullName = fullName;
+    if (address !== undefined) user.address = address;
+    if (occupation !== undefined) user.occupation = occupation;
+    if (school !== undefined) user.school = school;
+    if (church !== undefined) user.church = church;
+    if (profilePhoto) user.profilePhoto = profilePhoto;
+    if (dateOfBirth) user.dateOfBirth = new Date(dateOfBirth);
+    if (gender) user.gender = gender;
+    if (cbsLocation !== undefined) user.cbsLocation = cbsLocation;
+    await user.save();
+    const memberUpdate = { updatedAt: new Date() };
+    if (fullName) memberUpdate.fullName = fullName;
+    if (address !== undefined) memberUpdate.address = address;
+    if (occupation !== undefined) memberUpdate.occupation = occupation;
+    if (school !== undefined) memberUpdate.school = school;
+    if (church !== undefined) memberUpdate.church = church;
+    if (profilePhoto) memberUpdate.profilePhoto = profilePhoto;
+    if (dateOfBirth) memberUpdate.dateOfBirth = new Date(dateOfBirth);
+    if (gender) memberUpdate.gender = gender;
+    if (cbsLocation !== undefined) memberUpdate.cbsLocation = cbsLocation;
+    await Member.findOneAndUpdate(
+      { phoneNumber: user.phoneNumber },
+      memberUpdate,
+      { new: true },
+    );
+    await logActivity("updated their profile", req.user);
+    res.json({ ...user.toObject(), password: undefined });
+  } catch (error) {
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+app.put("/api/profile/password", authMiddleware, async (req, res) => {
+  try {
+    const { currentPassword, newPassword } = req.body;
+    const user = await User.findById(req.user._id);
+    if (!(await bcrypt.compare(currentPassword, user.password)))
+      return res.status(401).json({ error: "Current password is incorrect" });
+    user.password = await bcrypt.hash(newPassword, 10);
+    await user.save();
+    res.json({ message: "Password updated successfully" });
+  } catch (error) {
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+// ========== MEMBERS ROUTES ==========
 app.get("/api/members", authMiddleware, async (req, res) => {
   try {
-    const { group, status, search, steward, cbsLocation } = req.query;
+    const { group, status, search, steward, cbsLocation, branch, assignedTo } =
+      req.query;
     let query = {};
-    // cbsOnly=true signals a CBS register fetch — skip group filter so ALL members
-    // at that CBS location show up, even those from other groups.
     const cbsOnly = req.query.cbsOnly === "true";
     if (!cbsOnly && req.user.role === "Group Leader" && req.user.group)
       query.group = req.user.group;
+    if (req.user.role === "Branch Head Shepherd" && req.user.branch)
+      query.branch = req.user.branch;
     if (group && group !== "All Groups") query.group = group;
+    if (branch && branch !== "All Branches") query.branch = branch;
     if (status && status !== "All Statuses") query.membershipStatus = status;
     if (steward === "true") query.isSteward = true;
     if (cbsLocation && cbsLocation !== "All Locations")
       query.cbsLocation = cbsLocation;
+    if (assignedTo) query.assignedTo = assignedTo;
     if (search)
       query.$or = [
         { fullName: { $regex: search, $options: "i" } },
         { phoneNumber: { $regex: search, $options: "i" } },
       ];
-
     const members = await Member.find(query).sort({ createdAt: -1 });
-
-    // Enrich each member with profilePhoto from the User collection
-    // (existing Member documents may not have profilePhoto stored directly)
     const phoneNumbers = members.map((m) => m.phoneNumber);
     const users = await User.find(
       { phoneNumber: { $in: phoneNumbers } },
@@ -615,46 +903,38 @@ app.get("/api/members", authMiddleware, async (req, res) => {
     users.forEach((u) => {
       if (u.profilePhoto) userPhotoMap[u.phoneNumber] = u.profilePhoto;
     });
-
     const enriched = members.map((m) => {
       const obj = m.toObject();
-      // Use member's own profilePhoto if set, otherwise fall back to user's photo
-      if (!obj.profilePhoto && userPhotoMap[m.phoneNumber]) {
+      if (!obj.profilePhoto && userPhotoMap[m.phoneNumber])
         obj.profilePhoto = userPhotoMap[m.phoneNumber];
-      }
       return obj;
     });
-
     res.json(enriched);
   } catch (error) {
-    console.error("Get members error:", error);
     res.status(500).json({ error: "Server error" });
   }
 });
 
 app.post("/api/members", authMiddleware, async (req, res) => {
   try {
-    if (req.user.role === "Group Leader" && req.body.group !== req.user.group) {
+    if (req.user.role === "Group Leader" && req.body.group !== req.user.group)
       return res
         .status(403)
         .json({ error: "You can only add members to your own group" });
-    }
     const member = new Member({
       ...req.body,
+      branch: req.body.branch || req.user.branch || "MOR Head Quarter",
       addedBy: req.user._id,
       addedByName: req.user.fullName,
     });
     await member.save();
-
-    if (member.group) {
+    if (member.group)
       await Group.findOneAndUpdate(
         { name: member.group },
         { $inc: { memberCount: 1 } },
       );
-    }
     res.status(201).json(member);
   } catch (error) {
-    console.error("Add member error:", error);
     res.status(500).json({ error: "Server error" });
   }
 });
@@ -663,84 +943,89 @@ app.put("/api/members/:id", authMiddleware, async (req, res) => {
   try {
     const member = await Member.findById(req.params.id);
     if (!member) return res.status(404).json({ error: "Member not found" });
-    if (req.user.role === "Group Leader" && member.group !== req.user.group) {
+    if (req.user.role === "Group Leader" && member.group !== req.user.group)
       return res
         .status(403)
         .json({ error: "You can only update members in your own group" });
-    }
+
+    // ── FIX #3: Handle role field update — also sync User table role ──
+    const updateData = { ...req.body, updatedAt: new Date() };
     const updatedMember = await Member.findByIdAndUpdate(
       req.params.id,
-      { ...req.body, updatedAt: new Date() },
+      updateData,
       { new: true, runValidators: false },
     );
-    // If profilePhoto was updated, sync it to User record as well
-    if (req.body.profilePhoto) {
+
+    // Sync role to User table if role changed
+    if (req.body.role) {
+      const roleMap = {
+        "Head Shepherd": "Head Shepherd",
+        "Branch Head Shepherd": "Branch Head Shepherd",
+        "Group Leader": "Group Leader",
+        Member: "Member",
+      };
+      const newRole = roleMap[req.body.role] || "Member";
+      await User.findOneAndUpdate(
+        { phoneNumber: member.phoneNumber },
+        {
+          role: newRole,
+          isBranchShepherd: newRole === "Branch Head Shepherd",
+          isGroupLeader: newRole === "Group Leader",
+        },
+        { runValidators: false },
+      );
+    }
+    if (req.body.profilePhoto)
       await User.findOneAndUpdate(
         { phoneNumber: member.phoneNumber },
         { profilePhoto: req.body.profilePhoto },
         { runValidators: false },
       );
-    }
     await logActivity(`updated member ${member.fullName}`, req.user);
     res.json(updatedMember);
   } catch (error) {
-    console.error("Update member error:", error);
     res.status(500).json({ error: "Server error" });
   }
 });
 
-// DELETE member — removes member record, user account, and attendance records
 app.delete(
   "/api/members/:id",
   authMiddleware,
-  roleMiddleware("Head Shepherd", "System Admin", "Group Leader"),
+  roleMiddleware(
+    "Head Shepherd",
+    "Branch Head Shepherd",
+    "System Admin",
+    "Group Leader",
+  ),
   async (req, res) => {
     try {
       const member = await Member.findById(req.params.id);
       if (!member) return res.status(404).json({ error: "Member not found" });
-      if (req.user.role === "Group Leader" && member.group !== req.user.group) {
+      if (req.user.role === "Group Leader" && member.group !== req.user.group)
         return res
           .status(403)
           .json({ error: "You can only delete members in your own group" });
-      }
       const memberName = member.fullName;
-      const phoneNumber = member.phoneNumber;
-
-      // 1. Delete member record
       await Member.findByIdAndDelete(req.params.id);
-
-      // 2. Delete user account if exists
-      await User.findOneAndDelete({ phoneNumber });
-
-      // 3. Remove member from all attendance records
+      await User.findOneAndDelete({ phoneNumber: member.phoneNumber });
       await Attendance.updateMany(
         { "records.memberName": memberName },
-        { $pull: { records: { memberName: memberName } } },
+        { $pull: { records: { memberName } } },
       );
-
-      // 4. Decrement group count
-      if (member.group) {
+      await Assignment.deleteMany({ member: req.params.id });
+      if (member.group)
         await Group.findOneAndUpdate(
           { name: member.group },
           { $inc: { memberCount: -1 } },
         );
-      }
-
-      await logActivity(
-        `deleted member ${memberName} and all their records`,
-        req.user,
-      );
-      res.json({
-        message: `Member ${memberName} and all records deleted successfully`,
-      });
+      await logActivity(`deleted member ${memberName}`, req.user);
+      res.json({ message: `Member ${memberName} deleted successfully` });
     } catch (error) {
-      console.error("Delete member error:", error);
       res.status(500).json({ error: error.message || "Server error" });
     }
   },
 );
 
-// Sync profilePhoto from User → Member for all existing members (back-fill)
 app.post(
   "/api/members/sync-photos",
   authMiddleware,
@@ -769,7 +1054,6 @@ app.post(
       }
       res.json({ message: `Synced photos for ${synced} members`, synced });
     } catch (error) {
-      console.error("Sync photos error:", error);
       res.status(500).json({ error: "Server error" });
     }
   },
@@ -782,48 +1066,37 @@ app.post(
     try {
       const member = await Member.findById(req.params.id);
       if (!member) return res.status(404).json({ error: "Member not found" });
-      if (req.user.role === "Group Leader" && member.group !== req.user.group) {
+      if (req.user.role === "Group Leader" && member.group !== req.user.group)
         return res
           .status(403)
           .json({ error: "You can only manage stewards in your own group" });
-      }
       member.isSteward = !member.isSteward;
-      if (member.isSteward) {
-        member.stewardSince = new Date();
-      } else {
-        member.stewardSince = undefined;
-      }
+      member.stewardSince = member.isSteward ? new Date() : undefined;
       await member.save();
-
-      // Only update group stewardCount if member has a group
       if (member.group) {
         const stewardCount = await Member.countDocuments({
           group: member.group,
           isSteward: true,
         });
-        await Group.findOneAndUpdate(
-          { name: member.group },
-          { stewardCount: stewardCount },
-        );
+        await Group.findOneAndUpdate({ name: member.group }, { stewardCount });
       }
       res.json(member);
     } catch (error) {
-      console.error("Toggle steward error:", error);
       res.status(500).json({ error: "Server error" });
     }
   },
 );
 
-// ========== ATTENDANCE ROUTES (FIXED + CBS SUPPORT) ==========
+// ========== ATTENDANCE ROUTES ==========
 app.get("/api/attendance", authMiddleware, async (req, res) => {
   try {
-    const { type, group, cbsLocation, date } = req.query;
+    const { type, group, cbsLocation, date, branch } = req.query;
     let query = {};
-
     if (type) query.type = type;
-    if (group) query.group = group;
+    // ── FIX #5: For fellowship/evangelism, empty group means "all groups" ──
+    if (group && group !== "" && group !== "null") query.group = group;
     if (cbsLocation) query.cbsLocation = cbsLocation;
-
+    if (branch) query.branch = branch;
     if (date) {
       const start = new Date(date);
       start.setHours(0, 0, 0, 0);
@@ -831,31 +1104,36 @@ app.get("/api/attendance", authMiddleware, async (req, res) => {
       end.setDate(end.getDate() + 1);
       query.date = { $gte: start, $lt: end };
     }
-
+    if (req.user.role === "Member") {
+      const member = await Member.findOne({
+        phoneNumber: req.user.phoneNumber,
+      });
+      if (member) query["records.memberId"] = member._id;
+    } else if (req.user.role === "Group Leader" && req.user.group) {
+      if (!group) query.group = req.user.group;
+    } else if (req.user.role === "Branch Head Shepherd" && req.user.branch) {
+      if (!branch) query.branch = req.user.branch;
+    }
     const records = await Attendance.find(query).sort({ date: -1 }).lean();
-
     res.json(records);
   } catch (error) {
-    console.error("Get attendance error:", error);
     res.status(500).json({ error: "Server error" });
   }
 });
 
 app.post("/api/attendance", authMiddleware, async (req, res) => {
   try {
-    const { type, group, cbsLocation, date, records } = req.body;
-
-    if (!type || !date || !records) {
+    const { type, group, cbsLocation, date, records, branch } = req.body;
+    if (!type || !date || !records)
       return res.status(400).json({ error: "Missing required fields" });
-    }
-
     const total = records.length;
     const present = records.filter((r) => r.status === "present").length;
-
     const attendance = new Attendance({
       type,
-      group: type === "cbs" ? undefined : group,
+      // ── FIX #5: Don't store "all" as group name — use null instead ──
+      group: group && group !== "all" && group !== "" ? group : null,
       cbsLocation: type === "cbs" ? cbsLocation : undefined,
+      branch: branch || req.user.branch || null,
       date: new Date(date),
       records: records.map((r) => ({
         ...r,
@@ -870,102 +1148,84 @@ app.post("/api/attendance", authMiddleware, async (req, res) => {
       recordedBy: req.user._id,
       recordedByName: req.user.fullName,
     });
-
     await attendance.save();
     await logActivity(`recorded ${type} attendance`, req.user);
-
     res.status(201).json(attendance);
   } catch (error) {
-    console.error("Save attendance error:", error);
     res.status(500).json({ error: "Server error" });
   }
 });
 
-app.get("/api/attendance", authMiddleware, async (req, res) => {
-  try {
-    const { type, group, cbsLocation, date, limit = 50 } = req.query;
-    let query = {};
-    if (type) query.type = type;
-    if (group) query.group = group;
-    if (cbsLocation) query.cbsLocation = cbsLocation;
-    if (date) {
-      const d = new Date(date);
-      const next = new Date(d);
-      next.setDate(next.getDate() + 1);
-      query.date = { $gte: d, $lt: next };
-    }
-    if (req.user.role === "Member") {
-      const member = await Member.findOne({
-        phoneNumber: req.user.phoneNumber,
-      });
-      if (member) query["records.memberId"] = member._id;
-    } else if (req.user.role === "Group Leader" && req.user.group) {
-      query.group = req.user.group;
-    }
-    const attendance = await Attendance.find(query)
-      .sort({ date: -1 })
-      .limit(parseInt(limit));
-    res.json(attendance);
-  } catch (error) {
-    console.error("Get attendance error:", error);
-    res.status(500).json({ error: "Server error" });
-  }
-});
-
-// Update existing attendance record (upsert — prevents duplicate date entries)
 app.put("/api/attendance/:id", authMiddleware, async (req, res) => {
   try {
     const { records } = req.body;
     const attendance = await Attendance.findById(req.params.id);
     if (!attendance)
       return res.status(404).json({ error: "Attendance record not found" });
-
     attendance.records = records;
-    const total = records.length;
-    const present = records.filter((r) => r.status === "present").length;
-    const absent = total - present;
-    const percentage = total > 0 ? ((present / total) * 100).toFixed(1) : 0;
-    attendance.stats = { total, present, absent, percentage };
-    attendance.updatedAt = new Date();
+    const total = records.length,
+      present = records.filter((r) => r.status === "present").length;
+    attendance.stats = {
+      total,
+      present,
+      absent: total - present,
+      percentage: total > 0 ? ((present / total) * 100).toFixed(1) : 0,
+    };
     await attendance.save();
-    await logActivity(
-      `updated ${attendance.type} attendance for ${attendance.group || attendance.cbsLocation || ""} on ${new Date(attendance.date).toLocaleDateString()}`,
-      req.user,
-    );
     res.json(attendance);
   } catch (error) {
-    console.error("Update attendance error:", error);
     res.status(500).json({ error: "Server error" });
   }
 });
 
-// ========== DASHBOARD ROUTES ==========
-
+// ========== DASHBOARD ROUTES — FIX #1: Branch filtering for Head Shepherd ==========
 app.get("/api/dashboard/stats", authMiddleware, async (req, res) => {
   try {
-    let totalMembers = await Member.countDocuments();
-    let totalStewards = await Member.countDocuments({ isSteward: true });
+    let memberQuery = {},
+      stewardQuery = { isSteward: true },
+      groupQuery = {};
 
     if (req.user.role === "Group Leader" && req.user.group) {
-      totalMembers = await Member.countDocuments({ group: req.user.group });
-      totalStewards = await Member.countDocuments({
-        group: req.user.group,
-        isSteward: true,
-      });
+      memberQuery.group = req.user.group;
+      stewardQuery.group = req.user.group;
+      groupQuery.name = req.user.group;
+    } else if (req.user.role === "Branch Head Shepherd" && req.user.branch) {
+      memberQuery.branch = req.user.branch;
+      stewardQuery.branch = req.user.branch;
+      groupQuery.branch = req.user.branch;
     } else if (req.user.role === "Member") {
-      totalMembers = 1;
-      totalStewards = 0;
+      return res.json({
+        totalMembers: 1,
+        activeGroups: 0,
+        totalStewards: 0,
+        totalCBSLocations: 0,
+        groupPerformance: [],
+      });
+    } else {
+      // Head Shepherd or System Admin — respect the branch query param
+      if (req.query.branch && req.query.branch !== "all") {
+        memberQuery.branch = req.query.branch;
+        stewardQuery.branch = req.query.branch;
+        groupQuery.branch = req.query.branch;
+      }
     }
 
-    const groups = await Group.find();
+    const [totalMembers, totalStewards, groups, totalCBSLocations] =
+      await Promise.all([
+        Member.countDocuments(memberQuery),
+        Member.countDocuments(stewardQuery),
+        Group.find(groupQuery),
+        CBSLocation.countDocuments(),
+      ]);
+
     const groupPerformance = [];
     for (const group of groups) {
-      const groupMembers = await Member.find({ group: group.name });
+      const gm = await Member.find({ group: group.name });
       groupPerformance.push({
         name: group.name,
-        memberCount: groupMembers.length,
-        stewardCount: groupMembers.filter((m) => m.isSteward).length,
-        intenseLeaderCount: groupMembers.filter(
+        memberCount: gm.length,
+        stewardCount: gm.filter((m) => m.isSteward).length,
+        intenseLeaderCount: gm.filter(
           (m) => m.membershipStatus === "Intense Leader",
         ).length,
       });
@@ -975,21 +1235,22 @@ app.get("/api/dashboard/stats", authMiddleware, async (req, res) => {
       totalMembers,
       activeGroups: groups.length,
       totalStewards,
-      totalCBSLocations: await CBSLocation.countDocuments(),
+      totalCBSLocations,
       groupPerformance,
     });
   } catch (error) {
-    console.error("Dashboard stats error:", error);
     res.status(500).json({ error: "Server error" });
   }
 });
 
 // ========== GROUPS ROUTES ==========
-
-app.get("/api/groups", authMiddleware, async (req, res) => {
+app.get("/api/groups", async (req, res) => {
   try {
-    const groups = await Group.find();
-    const members = await Member.find();
+    const query = {};
+    if (req.query.branch) query.branch = req.query.branch;
+    const groups = await Group.find(query);
+    const memberQuery = query.branch ? { branch: query.branch } : {};
+    const members = await Member.find(memberQuery);
     const groupsWithCounts = groups.map((group) => ({
       ...group.toObject(),
       memberCount: members.filter((m) => m.group === group.name).length,
@@ -999,43 +1260,34 @@ app.get("/api/groups", authMiddleware, async (req, res) => {
         (m) =>
           m.group === group.name && m.membershipStatus === "Intense Leader",
       ).length,
-      potentialLeaderCount: members.filter(
-        (m) =>
-          m.group === group.name && m.membershipStatus === "Potential Leader",
-      ).length,
       consistentCount: members.filter(
         (m) => m.group === group.name && m.membershipStatus === "Consistent",
       ).length,
     }));
     res.json(groupsWithCounts);
   } catch (error) {
-    console.error("Get groups error:", error);
     res.status(500).json({ error: "Server error" });
   }
 });
 
-// POST — create a new group
 app.post(
   "/api/groups",
   authMiddleware,
-  roleMiddleware("Head Shepherd", "System Admin"),
+  roleMiddleware("Head Shepherd", "Branch Head Shepherd", "System Admin"),
   async (req, res) => {
     try {
-      const { name, description, leaderId } = req.body;
+      const { name, description, leaderId, branch } = req.body;
       if (!name)
         return res.status(400).json({ error: "Group name is required" });
-      const existing = await Group.findOne({ name });
-      if (existing)
+      if (await Group.findOne({ name }))
         return res.status(400).json({ error: "Group already exists" });
-
       let leaderInfo = {};
       if (leaderId) {
-        let leaderUser = await User.findById(leaderId);
-        if (!leaderUser) {
-          const m = await Member.findById(leaderId);
-          if (m)
-            leaderUser = await User.findOne({ phoneNumber: m.phoneNumber });
-        }
+        let leaderUser =
+          (await User.findById(leaderId)) ||
+          (await User.findOne({
+            phoneNumber: (await Member.findById(leaderId))?.phoneNumber,
+          }));
         if (leaderUser) {
           leaderInfo = {
             leader: leaderUser._id,
@@ -1048,9 +1300,9 @@ app.post(
           });
         }
       }
-
       const group = new Group({
         name,
+        branch: branch || req.user.branch || "MOR Head Quarter",
         description: description || `${name} Ministry Group`,
         isActive: true,
         memberCount: 0,
@@ -1060,27 +1312,6 @@ app.post(
       await logActivity(`created group "${name}"`, req.user);
       res.status(201).json(group);
     } catch (error) {
-      console.error("Create group error:", error);
-      res.status(500).json({ error: "Server error" });
-    }
-  },
-);
-
-// DELETE — remove a group
-app.delete(
-  "/api/groups/:id",
-  authMiddleware,
-  roleMiddleware("Head Shepherd", "System Admin"),
-  async (req, res) => {
-    try {
-      const group = await Group.findById(req.params.id);
-      if (!group) return res.status(404).json({ error: "Group not found" });
-      const groupName = group.name;
-      await Group.findByIdAndDelete(req.params.id);
-      await logActivity(`deleted group "${groupName}"`, req.user);
-      res.json({ message: "Group deleted successfully" });
-    } catch (error) {
-      console.error("Delete group error:", error);
       res.status(500).json({ error: "Server error" });
     }
   },
@@ -1089,91 +1320,95 @@ app.delete(
 app.put(
   "/api/groups/:id",
   authMiddleware,
-  roleMiddleware("Head Shepherd", "System Admin"),
+  roleMiddleware("Head Shepherd", "Branch Head Shepherd", "System Admin"),
   async (req, res) => {
     try {
       const { name, description, leaderId, assistantLeaderId } = req.body;
       const group = await Group.findById(req.params.id);
       if (!group) return res.status(404).json({ error: "Group not found" });
-
       if (name) group.name = name;
       if (description !== undefined) group.description = description;
-
-      // Helper: resolve member/user ID to a User
       const resolveToUser = async (id) => {
         if (!id) return null;
-        let u = await User.findById(id);
-        if (!u) {
-          const m = await Member.findById(id);
-          if (m) u = await User.findOne({ phoneNumber: m.phoneNumber });
-        }
-        return u;
+        return (
+          (await User.findById(id)) ||
+          (await User.findOne({
+            phoneNumber: (await Member.findById(id))?.phoneNumber,
+          }))
+        );
       };
-
-      // Head Leader
       if (leaderId !== undefined) {
-        const leaderUser = await resolveToUser(leaderId);
-        if (leaderUser) {
-          group.leader = leaderUser._id;
-          group.leaderName = leaderUser.fullName;
-          group.leaderPhone = leaderUser.phoneNumber;
-          await User.findByIdAndUpdate(leaderUser._id, {
+        const u = await resolveToUser(leaderId);
+        if (u) {
+          group.leader = u._id;
+          group.leaderName = u.fullName;
+          group.leaderPhone = u.phoneNumber;
+          await User.findByIdAndUpdate(u._id, {
             isGroupLeader: true,
             role: "Group Leader",
+            group: group.name,
           });
           await Member.findOneAndUpdate(
-            { phoneNumber: leaderUser.phoneNumber },
-            { isGroupLeader: true },
+            { phoneNumber: u.phoneNumber },
+            { isGroupLeader: true, group: group.name },
             { runValidators: false },
           );
-        } else if (leaderId === "" || leaderId === null) {
+        } else if (!leaderId) {
           group.leader = null;
           group.leaderName = null;
           group.leaderPhone = null;
         }
       }
-
-      // Assistant Head Leader
       if (assistantLeaderId !== undefined) {
-        const assistantUser = await resolveToUser(assistantLeaderId);
-        if (assistantUser) {
-          group.assistantLeader = assistantUser._id;
-          group.assistantLeaderName = assistantUser.fullName;
-          group.assistantLeaderPhone = assistantUser.phoneNumber;
-          await User.findByIdAndUpdate(assistantUser._id, {
+        const u = await resolveToUser(assistantLeaderId);
+        if (u) {
+          group.assistantLeader = u._id;
+          group.assistantLeaderName = u.fullName;
+          group.assistantLeaderPhone = u.phoneNumber;
+          await User.findByIdAndUpdate(u._id, {
             isGroupLeader: true,
             role: "Group Leader",
+            group: group.name,
           });
-          await Member.findOneAndUpdate(
-            { phoneNumber: assistantUser.phoneNumber },
-            { isGroupLeader: true },
-            { runValidators: false },
-          );
-        } else if (assistantLeaderId === "" || assistantLeaderId === null) {
+        } else if (!assistantLeaderId) {
           group.assistantLeader = null;
           group.assistantLeaderName = null;
           group.assistantLeaderPhone = null;
         }
       }
-
       await group.save();
-      await logActivity(`updated group "${group.name}"`, req.user);
       res.json(group);
     } catch (error) {
-      console.error("Update group error:", error);
       res.status(500).json({ error: "Server error" });
     }
   },
 );
 
-// ========== CBS LOCATIONS ROUTES ==========
+app.delete(
+  "/api/groups/:id",
+  authMiddleware,
+  roleMiddleware("Head Shepherd", "System Admin"),
+  async (req, res) => {
+    try {
+      const group = await Group.findById(req.params.id);
+      if (!group) return res.status(404).json({ error: "Group not found" });
+      await Group.findByIdAndDelete(req.params.id);
+      res.json({ message: "Group deleted successfully" });
+    } catch (error) {
+      res.status(500).json({ error: "Server error" });
+    }
+  },
+);
 
+// ========== CBS LOCATIONS ==========
 app.get("/api/cbs-locations", authMiddleware, async (req, res) => {
   try {
-    const locations = await CBSLocation.find();
-    res.json(locations);
+    const query = {};
+    if (req.query.branch) query.branch = req.query.branch;
+    else if (req.user.role === "Branch Head Shepherd")
+      query.branch = req.user.branch;
+    res.json(await CBSLocation.find(query));
   } catch (error) {
-    console.error("Get CBS locations error:", error);
     res.status(500).json({ error: "Server error" });
   }
 });
@@ -1181,39 +1416,32 @@ app.get("/api/cbs-locations", authMiddleware, async (req, res) => {
 app.post(
   "/api/cbs-locations",
   authMiddleware,
-  roleMiddleware("Head Shepherd", "System Admin"),
+  roleMiddleware("Head Shepherd", "Branch Head Shepherd", "System Admin"),
   async (req, res) => {
     try {
-      const { name, leaderId, associatedGroups } = req.body;
-
-      const existing = await CBSLocation.findOne({ name });
-      if (existing) {
+      const { name, leaderId, associatedGroups, branch } = req.body;
+      if (await CBSLocation.findOne({ name }))
         return res.status(400).json({ error: "CBS location already exists" });
-      }
-
       let leaderInfo = {};
       if (leaderId) {
         const leader = await User.findById(leaderId);
-        if (leader) {
+        if (leader)
           leaderInfo = {
             leader: leaderId,
             leaderName: leader.fullName,
             leaderPhone: leader.phoneNumber,
           };
-        }
       }
-
       const location = new CBSLocation({
         name,
+        branch: branch || req.user.branch || "MOR Head Quarter",
         associatedGroups: associatedGroups || [],
         status: "Active",
         ...leaderInfo,
       });
-
       await location.save();
       res.status(201).json(location);
     } catch (error) {
-      console.error("Create CBS location error:", error);
       res.status(500).json({ error: "Server error" });
     }
   },
@@ -1221,43 +1449,23 @@ app.post(
 
 app.put("/api/cbs-locations/:id", authMiddleware, async (req, res) => {
   try {
-    const { id } = req.params;
-    const { name, leaderId, status } = req.body;
-
-    const location = await CBSLocation.findById(id);
-    if (!location) {
+    const location = await CBSLocation.findById(req.params.id);
+    if (!location)
       return res.status(404).json({ error: "CBS location not found" });
-    }
-
-    // Update fields
+    const { name, leaderId, status } = req.body;
     if (name) location.name = name;
     if (status) location.status = status;
-
-    // Update leader if provided
     if (leaderId) {
-      // Try User first, then Member (frontend passes Member _id)
       let leaderUser = await User.findById(leaderId);
       if (!leaderUser) {
-        const leaderMember = await Member.findById(leaderId);
-        if (leaderMember) {
-          leaderUser = await User.findOne({
-            phoneNumber: leaderMember.phoneNumber,
-          });
-          // If no user account, use member info directly
-          if (!leaderUser) {
-            location.leader = leaderMember._id;
-            location.leaderName = leaderMember.fullName;
-            location.leaderPhone = leaderMember.phoneNumber;
-            await location.save();
-            return res.json(location);
-          }
-        }
+        const lm = await Member.findById(leaderId);
+        if (lm)
+          leaderUser = await User.findOne({ phoneNumber: lm.phoneNumber });
       }
       if (leaderUser) {
         location.leader = leaderUser._id;
         location.leaderName = leaderUser.fullName;
         location.leaderPhone = leaderUser.phoneNumber;
-        // Update user's CBS leader status
         await User.findByIdAndUpdate(leaderUser._id, {
           isCBSLeader: true,
           assignedCBSLocation: location.name,
@@ -1268,16 +1476,13 @@ app.put("/api/cbs-locations/:id", authMiddleware, async (req, res) => {
         );
       }
     } else if (leaderId === "" || leaderId === null) {
-      // Remove leader
       location.leader = null;
       location.leaderName = null;
       location.leaderPhone = null;
     }
-
     await location.save();
     res.json(location);
   } catch (error) {
-    console.error("Update CBS location error:", error);
     res.status(500).json({ error: "Server error" });
   }
 });
@@ -1288,21 +1493,552 @@ app.delete(
   roleMiddleware("Head Shepherd", "System Admin"),
   async (req, res) => {
     try {
-      const { id } = req.params;
-      const location = await CBSLocation.findByIdAndDelete(id);
-      if (!location) {
+      const loc = await CBSLocation.findByIdAndDelete(req.params.id);
+      if (!loc)
         return res.status(404).json({ error: "CBS location not found" });
-      }
       res.json({ message: "CBS location deleted successfully" });
     } catch (error) {
-      console.error("Delete CBS location error:", error);
       res.status(500).json({ error: "Server error" });
     }
   },
 );
 
-// ========== NOTIFICATION ROUTES ==========
+// ========== BRANCHES ==========
+app.get("/api/branches", async (req, res) => {
+  try {
+    const branches = await Branch.find();
+    res.json(branches);
+  } catch (error) {
+    res.status(500).json({ error: "Server error" });
+  }
+});
 
+app.post(
+  "/api/branches",
+  authMiddleware,
+  roleMiddleware("Head Shepherd", "System Admin"),
+  async (req, res) => {
+    try {
+      const { name, description } = req.body;
+      if (!name)
+        return res.status(400).json({ error: "Branch name is required" });
+      if (await Branch.findOne({ name }))
+        return res.status(400).json({ error: "Branch already exists" });
+      const branch = new Branch({
+        name,
+        description: description || `${name} Branch`,
+        isActive: true,
+      });
+      await branch.save();
+      await logActivity(`created branch "${name}"`, req.user);
+      res.status(201).json(branch);
+    } catch (error) {
+      res.status(500).json({ error: "Server error" });
+    }
+  },
+);
+
+// ========== FIX #4: Branch Shepherd Assignment — saves name to DB + updates User table ==========
+app.put(
+  "/api/branches/:id",
+  authMiddleware,
+  roleMiddleware("Head Shepherd", "System Admin"),
+  async (req, res) => {
+    try {
+      const branch = await Branch.findById(req.params.id);
+      if (!branch) return res.status(404).json({ error: "Branch not found" });
+      const { name, description, headShepherdId, headShepherdPhone } = req.body;
+      if (name) branch.name = name;
+      if (description) branch.description = description;
+      if (headShepherdId || headShepherdPhone) {
+        // Support both ID-based and phone-based lookup
+        let shepherd = null;
+        if (headShepherdId) {
+          shepherd = await User.findById(headShepherdId).catch(() => null);
+          if (!shepherd) {
+            const m = await Member.findById(headShepherdId).catch(() => null);
+            if (m)
+              shepherd = await User.findOne({ phoneNumber: m.phoneNumber });
+          }
+        }
+        if (!shepherd && headShepherdPhone) {
+          shepherd = await User.findOne({ phoneNumber: headShepherdPhone });
+          // Also try Member lookup to get the User
+          if (!shepherd) {
+            const m = await Member.findOne({ phoneNumber: headShepherdPhone });
+            if (m)
+              shepherd = await User.findOne({ phoneNumber: m.phoneNumber });
+          }
+        }
+        if (shepherd) {
+          branch.headShepherd = shepherd._id;
+          branch.headShepherdName = shepherd.fullName;
+          branch.headShepherdPhone = shepherd.phoneNumber;
+
+          // Update User record with Branch Head Shepherd role
+          await User.findByIdAndUpdate(shepherd._id, {
+            role: "Branch Head Shepherd",
+            branch: branch.name,
+            isBranchShepherd: true,
+          });
+
+          // Also update Member record for consistency
+          await Member.findOneAndUpdate(
+            { phoneNumber: shepherd.phoneNumber },
+            {
+              role: "Branch Head Shepherd",
+              branch: branch.name,
+              isBranchShepherd: true,
+            },
+            { runValidators: false },
+          );
+
+          console.log(
+            `✅ Assigned ${shepherd.fullName} as Branch Head Shepherd of ${branch.name}`,
+          );
+        }
+      }
+      const savedBranch = await branch.save();
+      res.json(savedBranch);
+    } catch (error) {
+      console.error("Branch update error:", error);
+      res.status(500).json({ error: "Server error" });
+    }
+  },
+);
+
+app.delete(
+  "/api/branches/:id",
+  authMiddleware,
+  roleMiddleware("Head Shepherd", "System Admin"),
+  async (req, res) => {
+    try {
+      const b = await Branch.findByIdAndDelete(req.params.id);
+      if (!b) return res.status(404).json({ error: "Branch not found" });
+      res.json({ message: "Branch deleted" });
+    } catch (error) {
+      res.status(500).json({ error: "Server error" });
+    }
+  },
+);
+
+// ========== QR ROUTES ==========
+app.post(
+  "/api/qr/generate",
+  authMiddleware,
+  roleMiddleware(
+    "Head Shepherd",
+    "Branch Head Shepherd",
+    "Group Leader",
+    "System Admin",
+  ),
+  async (req, res) => {
+    try {
+      const { type, group, cbsLocation, date } = req.body;
+      if (!type || !date)
+        return res.status(400).json({ error: "type and date required" });
+      const token = crypto.randomBytes(24).toString("hex");
+      const sessionDate = new Date(date);
+      const expiresAt = getQRExpiry(type, date);
+      if (new Date() > expiresAt)
+        return res.status(400).json({
+          error: "Registration time has already closed for this session",
+        });
+      const session = new QRSession({
+        token,
+        type,
+        group: group || req.user.group,
+        cbsLocation,
+        branch: req.user.branch || "MOR Head Quarter",
+        date: sessionDate,
+        expiresAt,
+        createdBy: req.user._id,
+        createdByName: req.user.fullName,
+        isActive: true,
+      });
+      await session.save();
+      const qrUrl = `${process.env.FRONTEND_URL || "https://mor-system-app.vercel.app"}/qr-scan.html?token=${token}`;
+      res.status(201).json({ token, qrUrl, session });
+    } catch (error) {
+      res.status(500).json({ error: "Server error" });
+    }
+  },
+);
+
+app.get("/api/qr/session/:token", async (req, res) => {
+  try {
+    const session = await QRSession.findOne({ token: req.params.token });
+    if (!session) return res.status(404).json({ error: "Invalid QR code" });
+    const now = new Date();
+    if (now > session.expiresAt)
+      return res.status(410).json({
+        error: "QR session expired — registration is closed",
+        expired: true,
+      });
+    res.json({
+      session: {
+        type: session.type,
+        group: session.group,
+        cbsLocation: session.cbsLocation,
+        date: session.date,
+        expiresAt: session.expiresAt,
+        branch: session.branch,
+      },
+    });
+  } catch (error) {
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+app.post("/api/qr/scan/:token", authMiddleware, async (req, res) => {
+  try {
+    const session = await QRSession.findOne({
+      token: req.params.token,
+      isActive: true,
+    });
+    if (!session)
+      return res.status(404).json({ error: "Invalid or inactive QR code" });
+    const now = new Date();
+    if (now > session.expiresAt)
+      return res.status(410).json({
+        error: "Attendance registration is now closed for this session",
+        expired: true,
+      });
+    const member = await Member.findOne({ phoneNumber: req.user.phoneNumber });
+    if (!member)
+      return res
+        .status(404)
+        .json({ error: "Member record not found for your account" });
+    const alreadyScanned = session.scans.find(
+      (s) => s.memberId?.toString() === member._id.toString(),
+    );
+    if (alreadyScanned)
+      return res.status(409).json({
+        error: "You have already scanned for this session",
+        alreadyScanned: true,
+      });
+    const timing = isOnTime(session.type, now) ? "on_time" : "late";
+    session.scans.push({
+      memberId: member._id,
+      memberName: member.fullName,
+      group: member.group,
+      membershipStatus: member.membershipStatus,
+      scanTime: now,
+      timing,
+    });
+    await session.save();
+    const dateStr = session.date.toISOString().split("T")[0];
+    const attQuery =
+      session.type === "cbs"
+        ? {
+            type: "cbs",
+            cbsLocation: session.cbsLocation,
+            date: {
+              $gte: new Date(dateStr + "T00:00:00"),
+              $lt: new Date(dateStr + "T23:59:59"),
+            },
+          }
+        : {
+            type: session.type,
+            group: session.group,
+            date: {
+              $gte: new Date(dateStr + "T00:00:00"),
+              $lt: new Date(dateStr + "T23:59:59"),
+            },
+          };
+    let attendance = await Attendance.findOne(attQuery);
+    if (attendance) {
+      const existingRecord = attendance.records.find(
+        (r) => r.memberName === member.fullName,
+      );
+      if (existingRecord) {
+        existingRecord.status = "present";
+        existingRecord.checkInTime = now;
+        existingRecord.scanMethod = "qr";
+      } else
+        attendance.records.push({
+          memberId: member._id,
+          memberName: member.fullName,
+          status: "present",
+          checkInTime: now,
+          scanMethod: "qr",
+        });
+      const presentCount = attendance.records.filter(
+        (r) => r.status === "present",
+      ).length;
+      attendance.stats = {
+        total: attendance.records.length,
+        present: presentCount,
+        absent: attendance.records.length - presentCount,
+        percentage: Math.round(
+          (presentCount / attendance.records.length) * 100,
+        ),
+      };
+      await attendance.save();
+    }
+    res.json({
+      message: `✅ Attendance recorded! You are ${timing === "on_time" ? "✅ On Time" : "⏰ Late"}`,
+      timing,
+      memberName: member.fullName,
+      scanTime: now,
+    });
+  } catch (error) {
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+app.get("/api/qr/sessions", authMiddleware, async (req, res) => {
+  try {
+    let query = {};
+    if (req.user.role === "Group Leader") query.group = req.user.group;
+    else if (req.user.role === "Branch Head Shepherd")
+      query.branch = req.user.branch;
+    const sessions = await QRSession.find(query)
+      .sort({ createdAt: -1 })
+      .limit(50);
+    res.json(sessions);
+  } catch (error) {
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+app.get("/api/qr/sessions/:id", authMiddleware, async (req, res) => {
+  try {
+    const session = await QRSession.findById(req.params.id);
+    if (!session) return res.status(404).json({ error: "Session not found" });
+    res.json(session);
+  } catch (error) {
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+// ========== FOLLOW-UP ASSIGNMENTS ==========
+app.get("/api/assignments", authMiddleware, async (req, res) => {
+  try {
+    let query = {};
+    if (req.user.role === "Group Leader") query.group = req.user.group;
+    else if (req.user.role === "Branch Head Shepherd")
+      query.branch = req.user.branch;
+    else if (req.user.role === "Member") query.assignedTo = req.user._id;
+    if (req.query.assignedTo) query.assignedTo = req.query.assignedTo;
+    if (req.query.group) query.group = req.query.group;
+    const assignments = await Assignment.find(query).sort({ createdAt: -1 });
+    res.json(assignments);
+  } catch (error) {
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+app.post(
+  "/api/assignments",
+  authMiddleware,
+  roleMiddleware(
+    "Head Shepherd",
+    "Branch Head Shepherd",
+    "Group Leader",
+    "System Admin",
+  ),
+  async (req, res) => {
+    try {
+      const { assignedToId, memberId, notes } = req.body;
+      if (!assignedToId || !memberId)
+        return res
+          .status(400)
+          .json({ error: "assignedToId and memberId required" });
+      const [assignedToUser, member] = await Promise.all([
+        User.findById(assignedToId),
+        Member.findById(memberId),
+      ]);
+      if (!assignedToUser)
+        return res.status(404).json({ error: "Leader/Steward not found" });
+      if (!member) return res.status(404).json({ error: "Member not found" });
+      if (req.user.role === "Group Leader" && member.group !== req.user.group)
+        return res
+          .status(403)
+          .json({ error: "You can only assign members in your own group" });
+      const existing = await Assignment.findOne({
+        assignedTo: assignedToId,
+        member: memberId,
+      });
+      if (existing)
+        return res
+          .status(409)
+          .json({ error: "This member is already assigned to this person" });
+      const assignment = new Assignment({
+        assignedBy: req.user._id,
+        assignedByName: req.user.fullName,
+        assignedTo: assignedToUser._id,
+        assignedToName: assignedToUser.fullName,
+        assignedToRole:
+          assignedToUser.membershipStatus === "Leader" ? "Leader" : "Steward",
+        assignedToStatus: assignedToUser.membershipStatus,
+        member: member._id,
+        memberName: member.fullName,
+        memberPhone: member.phoneNumber,
+        memberStatus: member.membershipStatus,
+        group: member.group,
+        branch: member.branch || "MOR Head Quarter",
+        notes: notes || "",
+      });
+      await assignment.save();
+      await Member.findByIdAndUpdate(memberId, {
+        assignedTo: assignedToUser._id,
+        assignedToName: assignedToUser.fullName,
+      });
+      await logActivity(
+        `assigned ${member.fullName} to ${assignedToUser.fullName} for follow-up`,
+        req.user,
+      );
+      res.status(201).json(assignment);
+    } catch (error) {
+      res.status(500).json({ error: "Server error" });
+    }
+  },
+);
+
+app.delete(
+  "/api/assignments/:id",
+  authMiddleware,
+  roleMiddleware(
+    "Head Shepherd",
+    "Branch Head Shepherd",
+    "Group Leader",
+    "System Admin",
+  ),
+  async (req, res) => {
+    try {
+      const assignment = await Assignment.findById(req.params.id);
+      if (!assignment)
+        return res.status(404).json({ error: "Assignment not found" });
+      await Member.findByIdAndUpdate(assignment.member, {
+        assignedTo: null,
+        assignedToName: null,
+      });
+      await Assignment.findByIdAndDelete(req.params.id);
+      res.json({ message: "Assignment removed" });
+    } catch (error) {
+      res.status(500).json({ error: "Server error" });
+    }
+  },
+);
+
+// ========== REPORTS ==========
+app.get("/api/reports", authMiddleware, async (req, res) => {
+  try {
+    let query = {};
+    if (req.user.role === "Group Leader") query.targetGroup = req.user.group;
+    else if (req.user.role === "Branch Head Shepherd")
+      query.targetBranch = req.user.branch;
+    const reports = await Report.find(query).sort({ createdAt: -1 }).limit(100);
+    res.json(reports);
+  } catch (error) {
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+app.post("/api/reports", authMiddleware, async (req, res) => {
+  try {
+    const { title, body, type, targetGroup, targetBranch } = req.body;
+    const scope = targetGroup ? "group" : targetBranch ? "branch" : "general";
+    const sentToUsers = await User.find(
+      { role: { $in: ["Head Shepherd", "System Admin"] } },
+      { _id: 1, fullName: 1, role: 1 },
+    );
+    const report = new Report({
+      title,
+      body,
+      type: type || "manual",
+      scope,
+      targetGroup,
+      targetBranch,
+      sentBy: req.user._id,
+      sentByName: req.user.fullName,
+      sentTo: sentToUsers.map((u) => ({
+        userId: u._id,
+        name: u.fullName,
+        role: u.role,
+      })),
+      period: {
+        start: new Date(new Date().getFullYear(), 0, 1),
+        end: new Date(),
+      },
+    });
+    await report.save();
+    await sendSystemNotification(
+      `📋 New Report: ${title}`,
+      `${req.user.fullName} submitted a report: ${title}`,
+      "report",
+    );
+    res.status(201).json(report);
+  } catch (error) {
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+app.put("/api/reports/:id/read", authMiddleware, async (req, res) => {
+  try {
+    await Report.findByIdAndUpdate(req.params.id, {
+      $addToSet: { readBy: req.user._id },
+    });
+    res.json({ message: "Marked as read" });
+  } catch (error) {
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+// ========== NOTIFICATION SCHEDULES ==========
+app.get("/api/notification-schedules", authMiddleware, async (req, res) => {
+  try {
+    res.json(await NotifSchedule.find().sort({ createdAt: -1 }));
+  } catch (error) {
+    res.status(500).json({ error: "Server error" });
+  }
+});
+app.post(
+  "/api/notification-schedules",
+  authMiddleware,
+  roleMiddleware("Head Shepherd", "System Admin"),
+  async (req, res) => {
+    try {
+      const s = new NotifSchedule({ ...req.body, createdBy: req.user._id });
+      await s.save();
+      res.status(201).json(s);
+    } catch (error) {
+      res.status(500).json({ error: "Server error" });
+    }
+  },
+);
+app.put(
+  "/api/notification-schedules/:id",
+  authMiddleware,
+  roleMiddleware("Head Shepherd", "System Admin"),
+  async (req, res) => {
+    try {
+      const s = await NotifSchedule.findByIdAndUpdate(req.params.id, req.body, {
+        new: true,
+      });
+      if (!s) return res.status(404).json({ error: "Schedule not found" });
+      res.json(s);
+    } catch (error) {
+      res.status(500).json({ error: "Server error" });
+    }
+  },
+);
+app.delete(
+  "/api/notification-schedules/:id",
+  authMiddleware,
+  roleMiddleware("Head Shepherd", "System Admin"),
+  async (req, res) => {
+    try {
+      await NotifSchedule.findByIdAndDelete(req.params.id);
+      res.json({ message: "Schedule deleted" });
+    } catch (error) {
+      res.status(500).json({ error: "Server error" });
+    }
+  },
+);
+
+// ========== NOTIFICATIONS ==========
 app.get("/api/notifications", authMiddleware, async (req, res) => {
   try {
     let query = {};
@@ -1310,6 +2046,7 @@ app.get("/api/notifications", authMiddleware, async (req, res) => {
       query = {
         $or: [
           { type: "general" },
+          { type: "reminder" },
           { type: "group", targetGroup: req.user.group },
           { type: "personal", targetUser: req.user._id },
         ],
@@ -1318,24 +2055,25 @@ app.get("/api/notifications", authMiddleware, async (req, res) => {
       query = {
         $or: [
           { type: "general" },
+          { type: "reminder" },
           { type: "group", targetGroup: req.user.group },
+          { type: "report" },
         ],
       };
     }
     const notifications = await Notification.find(query)
       .sort({ createdAt: -1 })
       .limit(50);
-    const notificationsWithStatus = notifications.map((notif) => ({
-      ...notif.toObject(),
-      isRead: notif.readBy.includes(req.user._id),
-    }));
-    res.json(notificationsWithStatus);
+    res.json(
+      notifications.map((n) => ({
+        ...n.toObject(),
+        isRead: n.readBy.includes(req.user._id),
+      })),
+    );
   } catch (error) {
-    console.error("Get notifications error:", error);
     res.status(500).json({ error: "Server error" });
   }
 });
-
 app.post("/api/notifications", authMiddleware, async (req, res) => {
   try {
     if (req.user.role === "Member") {
@@ -1349,214 +2087,50 @@ app.post("/api/notifications", authMiddleware, async (req, res) => {
       sentByRole: req.user.role,
     });
     await notification.save();
-    const target =
-      req.body.type === "general"
-        ? "all members"
-        : `${req.body.targetGroup || ""} group`;
-    await logActivity(
-      `sent notification "${notification.title}" to ${target}`,
-      req.user,
-    );
     res.status(201).json(notification);
   } catch (error) {
-    console.error("Send notification error:", error);
     res.status(500).json({ error: "Server error" });
   }
 });
-
 app.post("/api/notifications/:id/read", authMiddleware, async (req, res) => {
   try {
-    const notification = await Notification.findById(req.params.id);
-    if (!notification)
-      return res.status(404).json({ error: "Notification not found" });
-    if (!notification.readBy.includes(req.user._id)) {
-      notification.readBy.push(req.user._id);
-      await notification.save();
+    const n = await Notification.findById(req.params.id);
+    if (!n) return res.status(404).json({ error: "Notification not found" });
+    if (!n.readBy.includes(req.user._id)) {
+      n.readBy.push(req.user._id);
+      await n.save();
     }
     res.json({ message: "Marked as read" });
   } catch (error) {
-    console.error("Mark read error:", error);
     res.status(500).json({ error: "Server error" });
   }
 });
-
 app.delete("/api/notifications/:id", authMiddleware, async (req, res) => {
   try {
-    const notification = await Notification.findById(req.params.id);
-    if (!notification)
-      return res.status(404).json({ error: "Notification not found" });
-    // Only sender or Head Shepherd/Admin can delete
+    const n = await Notification.findById(req.params.id);
+    if (!n) return res.status(404).json({ error: "Notification not found" });
     if (
-      notification.sentBy.toString() !== req.user._id.toString() &&
+      n.sentBy?.toString() !== req.user._id.toString() &&
       !["Head Shepherd", "System Admin"].includes(req.user.role)
-    ) {
+    )
       return res
         .status(403)
         .json({ error: "You can only delete your own notifications" });
-    }
     await Notification.findByIdAndDelete(req.params.id);
     res.json({ message: "Notification deleted" });
   } catch (error) {
-    console.error("Delete notification error:", error);
-    res.status(500).json({ error: "Server error" });
-  }
-});
-
-// ========== PROFILE ROUTES ==========
-
-app.get("/api/profile", authMiddleware, async (req, res) => {
-  try {
-    const user = await User.findById(req.user._id).select("-password");
-    const member = await Member.findOne({ phoneNumber: req.user.phoneNumber });
-    // Merge: member fields take priority for ministry data, user for role/auth data
-    const profile = {
-      ...(member ? member.toObject() : {}),
-      fullName: user.fullName,
-      phoneNumber: user.phoneNumber,
-      role: user.role,
-      profilePhoto: member?.profilePhoto || user.profilePhoto || "",
-      dateOfBirth: member?.dateOfBirth || user.dateOfBirth,
-      gender: member?.gender || user.gender,
-      address: member?.address || user.address,
-      occupation: member?.occupation || user.occupation,
-      school: member?.school || user.school,
-      church: member?.church || user.church,
-      cbsLocation: member?.cbsLocation || user.cbsLocation,
-      group: member?.group || user.group,
-      membershipStatus: member?.membershipStatus || user.membershipStatus,
-      isSteward: member?.isSteward || user.isSteward || false,
-      stewardSince: member?.stewardSince || user.stewardSince,
-    };
-    res.json(profile);
-  } catch (error) {
-    console.error("Get profile error:", error);
-    res.status(500).json({ error: "Server error" });
-  }
-});
-
-app.put("/api/profile", authMiddleware, async (req, res) => {
-  try {
-    const {
-      fullName,
-      address,
-      occupation,
-      school,
-      church,
-      profilePhoto,
-      dateOfBirth,
-      gender,
-      cbsLocation,
-      group,
-      phoneNumber,
-    } = req.body;
-
-    const user = await User.findById(req.user._id);
-    if (!user) return res.status(404).json({ error: "User not found" });
-
-    if (fullName) user.fullName = fullName;
-    if (address !== undefined) user.address = address;
-    if (occupation !== undefined) user.occupation = occupation;
-    if (school !== undefined) user.school = school;
-    if (church !== undefined) user.church = church;
-    if (profilePhoto) user.profilePhoto = profilePhoto;
-    if (dateOfBirth) user.dateOfBirth = new Date(dateOfBirth);
-    if (gender) user.gender = gender;
-    if (cbsLocation !== undefined) user.cbsLocation = cbsLocation;
-    if (
-      group &&
-      [
-        "General",
-        "Success",
-        "Empowerment",
-        "Zoe",
-        "Favour",
-        "Dominion",
-      ].includes(group)
-    )
-      user.group = group;
-
-    await user.save();
-
-    // Sync to Member record
-    const memberUpdate = {};
-    if (fullName) memberUpdate.fullName = fullName;
-    if (address !== undefined) memberUpdate.address = address;
-    if (occupation !== undefined) memberUpdate.occupation = occupation;
-    if (school !== undefined) memberUpdate.school = school;
-    if (church !== undefined) memberUpdate.church = church;
-    if (profilePhoto) memberUpdate.profilePhoto = profilePhoto;
-    if (dateOfBirth) memberUpdate.dateOfBirth = new Date(dateOfBirth);
-    if (gender) memberUpdate.gender = gender;
-    if (cbsLocation !== undefined) memberUpdate.cbsLocation = cbsLocation;
-    if (
-      group &&
-      [
-        "General",
-        "Success",
-        "Empowerment",
-        "Zoe",
-        "Favour",
-        "Dominion",
-      ].includes(group)
-    )
-      memberUpdate.group = group;
-    memberUpdate.updatedAt = new Date();
-
-    await Member.findOneAndUpdate(
-      { phoneNumber: user.phoneNumber },
-      memberUpdate,
-      { new: true },
-    );
-
-    await logActivity(`updated their profile`, req.user);
-    res.json({ ...user.toObject(), password: undefined });
-  } catch (error) {
-    console.error("Update profile error:", error);
-    res.status(500).json({ error: "Server error" });
-  }
-});
-
-app.put("/api/profile/password", authMiddleware, async (req, res) => {
-  try {
-    const { currentPassword, newPassword } = req.body;
-    const user = await User.findById(req.user._id);
-    const isValid = await bcrypt.compare(currentPassword, user.password);
-    if (!isValid)
-      return res.status(401).json({ error: "Current password is incorrect" });
-    user.password = await bcrypt.hash(newPassword, 10);
-    await user.save();
-    await logActivity(`changed their password`, req.user);
-    res.json({ message: "Password updated successfully" });
-  } catch (error) {
-    console.error("Change password error:", error);
     res.status(500).json({ error: "Server error" });
   }
 });
 
 // ========== MEDIA ROUTES ==========
-
-// Media upload uses memory storage — buffer streamed to Cloudinary in the route
-const mediaUpload = multer({
-  storage: multer.memoryStorage(),
-  limits: { fileSize: 100 * 1024 * 1024 },
-});
-
-// Legacy local media files
-app.use(
-  "/uploads/media",
-  express.static(path.join(__dirname, "../frontend/uploads/media")),
-);
-
 app.get("/api/media", authMiddleware, async (req, res) => {
   try {
-    const media = await Media.find().sort({ createdAt: -1 });
-    res.json(media);
-  } catch (error) {
-    console.error("Get media error:", error);
+    res.json(await Media.find().sort({ createdAt: -1 }));
+  } catch (e) {
     res.status(500).json({ error: "Server error" });
   }
 });
-
 app.post(
   "/api/media",
   authMiddleware,
@@ -1566,10 +2140,8 @@ app.post(
       const { title, type, description } = req.body;
       if (!title || !type)
         return res.status(400).json({ error: "Title and type required" });
-
       let fileInfo = {};
       if (req.file) {
-        // Upload buffer to Cloudinary
         const cloudinaryUrl = await new Promise((resolve, reject) => {
           const stream = cloudinary.uploader.upload_stream(
             { folder: "mor-system/media", resource_type: "auto" },
@@ -1587,7 +2159,6 @@ app.post(
           mimeType: req.file.mimetype,
         };
       }
-
       const media = new Media({
         title,
         type,
@@ -1597,64 +2168,198 @@ app.post(
         uploadedByName: req.user.fullName,
       });
       await media.save();
-      await logActivity(`uploaded ${type} media: "${title}"`, req.user);
       res.status(201).json(media);
     } catch (error) {
-      console.error("Upload media error:", error);
       res.status(500).json({ error: "Server error" });
     }
   },
 );
-
 app.delete("/api/media/:id", authMiddleware, async (req, res) => {
   try {
     const media = await Media.findById(req.params.id);
     if (!media) return res.status(404).json({ error: "Media not found" });
-    if (media.filePath) {
-      const fullPath = path.join(__dirname, "../frontend", media.filePath);
-      if (fs.existsSync(fullPath)) fs.unlinkSync(fullPath);
-    }
     await Media.findByIdAndDelete(req.params.id);
-    await logActivity(`deleted media: "${media.title}"`, req.user);
     res.json({ message: "Media deleted" });
   } catch (error) {
-    console.error("Delete media error:", error);
     res.status(500).json({ error: "Server error" });
   }
 });
 
 // ========== ACTIVITY LOGS ==========
-
 app.get("/api/activity-logs", authMiddleware, async (req, res) => {
   try {
     const { limit = 100 } = req.query;
-    const logs = await ActivityLog.find()
-      .sort({ createdAt: -1 })
-      .limit(parseInt(limit));
-    res.json(logs);
+    res.json(
+      await ActivityLog.find().sort({ createdAt: -1 }).limit(parseInt(limit)),
+    );
   } catch (error) {
-    console.error("Get activity logs error:", error);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+app.delete("/api/activity-logs", authMiddleware, async (req, res) => {
+  try {
+    await ActivityLog.deleteMany({});
+    res.json({ message: "Activity logs cleared" });
+  } catch (error) {
     res.status(500).json({ error: "Server error" });
   }
 });
 
-app.delete("/api/activity-logs", authMiddleware, async (req, res) => {
+// ========== DEBUG ENDPOINT ==========
+app.get("/api/debug/user", authMiddleware, async (req, res) => {
   try {
-    await ActivityLog.deleteMany({});
-    res.json({ message: "All activity logs cleared" });
+    const user = await User.findById(req.user._id).select("-password");
+    res.json({
+      id: user._id,
+      fullName: user.fullName,
+      phoneNumber: user.phoneNumber,
+      role: user.role,
+      branch: user.branch,
+      isBranchShepherd: user.isBranchShepherd,
+      isGroupLeader: user.isGroupLeader,
+      isCBSLeader: user.isCBSLeader,
+      isSteward: user.isSteward,
+    });
   } catch (error) {
-    console.error("Clear activity logs error:", error);
     res.status(500).json({ error: "Server error" });
+  }
+});
+
+// ========== AUTOMATED CRON JOBS ==========
+cron.schedule("0 7 * * 1", async () => {
+  try {
+    console.log("⏰ Running weekly inconsistency check...");
+    const fourWeeksAgo = new Date();
+    fourWeeksAgo.setDate(fourWeeksAgo.getDate() - 28);
+    const groups = await Group.find();
+    for (const group of groups) {
+      const members = await Member.find({ group: group.name });
+      const [fellowshipAtt, cbsAtt, evangelismAtt] = await Promise.all([
+        Attendance.find({
+          type: "fellowship",
+          group: group.name,
+          date: { $gte: fourWeeksAgo },
+        }),
+        Attendance.find({ type: "cbs", date: { $gte: fourWeeksAgo } }),
+        Attendance.find({
+          type: "evangelism",
+          group: group.name,
+          date: { $gte: fourWeeksAgo },
+        }),
+      ]);
+      const inconsistent = [];
+      for (const member of members) {
+        const fCount = fellowshipAtt.filter((a) =>
+          a.records.some(
+            (r) => r.memberName === member.fullName && r.status === "present",
+          ),
+        ).length;
+        const cCount = cbsAtt.filter((a) =>
+          a.records.some(
+            (r) => r.memberName === member.fullName && r.status === "present",
+          ),
+        ).length;
+        const eCount = evangelismAtt.filter((a) =>
+          a.records.some(
+            (r) => r.memberName === member.fullName && r.status === "present",
+          ),
+        ).length;
+        const issues = [];
+        if (fellowshipAtt.length > 0 && fCount / fellowshipAtt.length < 0.5)
+          issues.push(`Fellowship: ${fCount}/${fellowshipAtt.length}`);
+        if (cbsAtt.length > 0 && cCount / cbsAtt.length < 0.5)
+          issues.push(`CBS: ${cCount}/${cbsAtt.length}`);
+        if (evangelismAtt.length > 0 && eCount / evangelismAtt.length < 0.5)
+          issues.push(`Evangelism: ${eCount}/${evangelismAtt.length}`);
+        if (issues.length > 0)
+          inconsistent.push({
+            name: member.fullName,
+            phone: member.phoneNumber,
+            issues,
+          });
+      }
+      if (inconsistent.length > 0) {
+        const bodyText = inconsistent
+          .map((m) => `• ${m.name} (${m.phone}): ${m.issues.join(", ")}`)
+          .join("\n");
+        await Report.create({
+          title: `Weekly Inconsistency Report — ${group.name} Group`,
+          type: "inconsistency",
+          scope: "group",
+          targetGroup: group.name,
+          body: `Members with below 50% attendance in the last 4 weeks:\n\n${bodyText}`,
+          data: { inconsistent },
+          period: { start: fourWeeksAgo, end: new Date() },
+          sentByName: "MOR System",
+        });
+        await sendSystemNotification(
+          `⚠️ ${group.name} Inconsistency Report`,
+          `${inconsistent.length} member(s) in ${group.name} group have inconsistent attendance.`,
+          "report",
+          group.name,
+        );
+      }
+    }
+    console.log("✅ Weekly inconsistency check complete");
+  } catch (e) {
+    console.error("Cron error:", e.message);
+  }
+});
+
+cron.schedule("0 * * * *", async () => {
+  try {
+    const now = new Date();
+    const schedules = await NotifSchedule.find({ isActive: true });
+    for (const sched of schedules) {
+      if (sched.schedule.hourUTC !== now.getUTCHours()) continue;
+      if (
+        sched.schedule.dayOfWeek !== undefined &&
+        sched.schedule.dayOfWeek !== now.getDay()
+      )
+        continue;
+      if (
+        sched.schedule.month !== undefined &&
+        sched.schedule.month !== now.getMonth() + 1
+      )
+        continue;
+      if (
+        sched.lastSent &&
+        new Date(sched.lastSent).toDateString() === now.toDateString()
+      )
+        continue;
+      await sendSystemNotification(
+        sched.title,
+        sched.message,
+        "reminder",
+        sched.targetGroup || null,
+      );
+      await NotifSchedule.findByIdAndUpdate(sched._id, { lastSent: now });
+      console.log(`✅ Sent scheduled reminder: ${sched.title}`);
+    }
+  } catch (e) {
+    console.error("Cron reminder error:", e.message);
   }
 });
 
 // ========== DATABASE INITIALIZATION ==========
-
 async function initializeDatabase() {
   try {
     console.log("📦 Setting up database structure...");
-
-    // Create default groups
+    const branches = [
+      "MOR Head Quarter",
+      "MOR Eastern Branch",
+      "MOR BO Branch",
+    ];
+    for (const branchName of branches) {
+      if (!(await Branch.findOne({ name: branchName }))) {
+        await Branch.create({
+          name: branchName,
+          description: branchName,
+          isActive: true,
+        });
+        console.log(`   ✓ Created branch: ${branchName}`);
+      }
+    }
     const groups = [
       "General",
       "Success",
@@ -1664,10 +2369,10 @@ async function initializeDatabase() {
       "Dominion",
     ];
     for (const groupName of groups) {
-      const existing = await Group.findOne({ name: groupName });
-      if (!existing) {
+      if (!(await Group.findOne({ name: groupName }))) {
         await Group.create({
           name: groupName,
+          branch: "MOR Head Quarter",
           isActive: true,
           memberCount: 0,
           stewardCount: 0,
@@ -1676,8 +2381,6 @@ async function initializeDatabase() {
         console.log(`   ✓ Created group: ${groupName}`);
       }
     }
-
-    // Create default CBS locations
     const locations = [
       "Brookfields",
       "Tengbeh Town",
@@ -1692,10 +2395,10 @@ async function initializeDatabase() {
       "Tree Planting",
     ];
     for (const location of locations) {
-      const existing = await CBSLocation.findOne({ name: location });
-      if (!existing) {
+      if (!(await CBSLocation.findOne({ name: location }))) {
         await CBSLocation.create({
           name: location,
+          branch: "MOR Head Quarter",
           status: "Active",
           memberCount: 0,
           associatedGroups: groups,
@@ -1703,33 +2406,49 @@ async function initializeDatabase() {
         console.log(`   ✓ Created CBS location: ${location}`);
       }
     }
-
-    console.log("✅ Database structure setup complete!");
-    console.log("\n📊 Database is ready with:");
-    console.log(`   - ${groups.length} groups`);
-    console.log(`   - ${locations.length} CBS locations`);
-    console.log("   - No users - system is clean");
-    console.log("\n💡 First user to register will become Head Shepherd\n");
+    const defaultSchedules = [
+      {
+        title: "🙏 Fellowship Reminder",
+        message:
+          "Fellowship is today at 1 PM! Join us for worship, the Word, and fellowship together. Be there and be a blessing!",
+        activityType: "fellowship",
+        schedule: { dayOfWeek: 6, weekPattern: "every", hourUTC: 9 },
+        isActive: true,
+      },
+      {
+        title: "📖 CBS Reminder",
+        message:
+          "CBS Bible Study is tonight! Come and grow in the Word of God. Let nothing keep you away from studying God's Word.",
+        activityType: "cbs",
+        schedule: { dayOfWeek: 2, weekPattern: "every", hourUTC: 14 },
+        isActive: true,
+      },
+      {
+        title: "🕊 Evangelism Reminder",
+        message:
+          "Evangelism is today! Let us go out and share the Good News. Souls are waiting! Be part of this great commission.",
+        activityType: "evangelism",
+        schedule: { dayOfWeek: 5, weekPattern: "first", hourUTC: 14 },
+        isActive: true,
+      },
+    ];
+    for (const sched of defaultSchedules) {
+      if (!(await NotifSchedule.findOne({ title: sched.title }))) {
+        await NotifSchedule.create(sched);
+        console.log(`   ✓ Created schedule: ${sched.title}`);
+      }
+    }
+    console.log("✅ Database initialization complete!");
   } catch (error) {
     console.error("❌ Database initialization error:", error);
   }
 }
 
-// ========== START SERVER ==========
-
 const PORT = process.env.PORT || 5000;
-
-// Always listen - required for Render
 app.listen(PORT, "0.0.0.0", () => {
-  console.log(`\n🚀 MOR System Backend Server`);
+  console.log(`\n🚀 MOR System Backend Server v2.0`);
   console.log(`📡 Running on http://0.0.0.0:${PORT}`);
-  console.log(`🔗 API Base URL: https://mor-system-backend.onrender.com/api`);
-  console.log(
-    `💚 Health check: https://mor-system-backend.onrender.com/api/health`,
-  );
-  console.log(`📡 Server: http://localhost:5000`);
+  console.log(`🔗 API: https://mor-system-backend.onrender.com/api`);
 });
-console.log(`\n✨ Ready to accept connections!\n`);
 
-// Export for serverless platforms (optional)
 module.exports = app;
