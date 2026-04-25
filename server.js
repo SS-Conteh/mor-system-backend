@@ -1895,19 +1895,40 @@ app.post(
         return res
           .status(400)
           .json({ error: "assignedToId and memberId required" });
-      const [assignedToUser, member] = await Promise.all([
-        User.findById(assignedToId),
-        Member.findById(memberId),
-      ]);
-      if (!assignedToUser)
+
+      // Look up leader/steward: try Member first (dropdown sends Member._id),
+      // then fall back to User for cases where IDs align
+      let assignedToMember = await Member.findById(assignedToId).catch(
+        () => null,
+      );
+      let assignedToUser = await User.findById(assignedToId).catch(() => null);
+
+      // If found as Member but not User, look up User by phone for the _id reference
+      if (assignedToMember && !assignedToUser) {
+        assignedToUser = await User.findOne({
+          phoneNumber: assignedToMember.phoneNumber,
+        }).catch(() => null);
+      }
+      if (!assignedToMember && !assignedToUser)
         return res.status(404).json({ error: "Leader/Steward not found" });
+
+      // Use whichever record we have for name/role
+      const assignedToName =
+        assignedToMember?.fullName || assignedToUser?.fullName || "Unknown";
+      const assignedToRole =
+        assignedToMember?.membershipStatus === "Leader" ? "Leader" : "Steward";
+      const assignedToStatus = assignedToMember?.membershipStatus || "";
+      // Use the User _id if available (for DB ref), else use the Member _id
+      const assignedToRef = assignedToUser?._id || assignedToMember?._id;
+
+      const member = await Member.findById(memberId);
       if (!member) return res.status(404).json({ error: "Member not found" });
       if (req.user.role === "Group Leader" && member.group !== req.user.group)
         return res
           .status(403)
           .json({ error: "You can only assign members in your own group" });
       const existing = await Assignment.findOne({
-        assignedTo: assignedToId,
+        assignedTo: assignedToRef,
         member: memberId,
       });
       if (existing)
@@ -1917,11 +1938,10 @@ app.post(
       const assignment = new Assignment({
         assignedBy: req.user._id,
         assignedByName: req.user.fullName,
-        assignedTo: assignedToUser._id,
-        assignedToName: assignedToUser.fullName,
-        assignedToRole:
-          assignedToUser.membershipStatus === "Leader" ? "Leader" : "Steward",
-        assignedToStatus: assignedToUser.membershipStatus,
+        assignedTo: assignedToRef,
+        assignedToName,
+        assignedToRole,
+        assignedToStatus,
         member: member._id,
         memberName: member.fullName,
         memberPhone: member.phoneNumber,
@@ -1932,11 +1952,11 @@ app.post(
       });
       await assignment.save();
       await Member.findByIdAndUpdate(memberId, {
-        assignedTo: assignedToUser._id,
-        assignedToName: assignedToUser.fullName,
+        assignedTo: assignedToRef,
+        assignedToName,
       });
       await logActivity(
-        `assigned ${member.fullName} to ${assignedToUser.fullName} for follow-up`,
+        `assigned ${member.fullName} to ${assignedToName} for follow-up`,
         req.user,
       );
       res.status(201).json(assignment);
