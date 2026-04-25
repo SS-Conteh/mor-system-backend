@@ -373,6 +373,7 @@ const ActivityLogSchema = new mongoose.Schema({
   user: { type: mongoose.Schema.Types.ObjectId, ref: "User" },
   userName: String,
   userRole: String,
+  branch: { type: String, default: null },
   details: String,
   ipAddress: String,
   createdAt: { type: Date, default: Date.now },
@@ -391,6 +392,7 @@ const MediaSchema = new mongoose.Schema({
   filePath: String,
   fileSize: Number,
   mimeType: String,
+  branch: { type: String, default: null },
   uploadedBy: { type: mongoose.Schema.Types.ObjectId, ref: "User" },
   uploadedByName: String,
   createdAt: { type: Date, default: Date.now },
@@ -478,6 +480,7 @@ async function logActivity(action, user, details = "") {
       user: user?._id,
       userName: user?.fullName || "System",
       userRole: user?.role || "System",
+      branch: user?.branch || null,
       details,
     });
   } catch (e) {}
@@ -1222,7 +1225,13 @@ app.get("/api/dashboard/stats", authMiddleware, async (req, res) => {
         Member.countDocuments(memberQuery),
         Member.countDocuments(stewardQuery),
         Group.find(groupQuery),
-        CBSLocation.countDocuments(),
+        CBSLocation.countDocuments(
+          req.user.role === "Branch Head Shepherd" && req.user.branch
+            ? { branch: req.user.branch }
+            : groupQuery.branch
+              ? { branch: groupQuery.branch }
+              : {},
+        ),
       ]);
 
     const groupPerformance = [];
@@ -1351,6 +1360,14 @@ app.put(
       const { name, description, leaderId, assistantLeaderId } = req.body;
       const group = await Group.findById(req.params.id);
       if (!group) return res.status(404).json({ error: "Group not found" });
+      // Branch Head Shepherd can only update groups in their own branch
+      if (
+        req.user.role === "Branch Head Shepherd" &&
+        group.branch !== req.user.branch
+      )
+        return res
+          .status(403)
+          .json({ error: "You can only update groups in your own branch" });
       if (name) group.name = name;
       if (description !== undefined) group.description = description;
       const resolveToUser = async (id) => {
@@ -1412,11 +1429,19 @@ app.put(
 app.delete(
   "/api/groups/:id",
   authMiddleware,
-  roleMiddleware("Head Shepherd", "System Admin"),
+  roleMiddleware("Head Shepherd", "Branch Head Shepherd", "System Admin"),
   async (req, res) => {
     try {
       const group = await Group.findById(req.params.id);
       if (!group) return res.status(404).json({ error: "Group not found" });
+      // Branch Head Shepherd can only delete groups in their own branch
+      if (
+        req.user.role === "Branch Head Shepherd" &&
+        group.branch !== req.user.branch
+      )
+        return res
+          .status(403)
+          .json({ error: "You can only delete groups in your own branch" });
       await Group.findByIdAndDelete(req.params.id);
       res.json({ message: "Group deleted successfully" });
     } catch (error) {
@@ -1952,8 +1977,12 @@ app.get("/api/reports", authMiddleware, async (req, res) => {
   try {
     let query = {};
     if (req.user.role === "Group Leader") query.targetGroup = req.user.group;
-    else if (req.user.role === "Branch Head Shepherd")
-      query.targetBranch = req.user.branch;
+    else if (req.user.role === "Branch Head Shepherd" && req.user.branch) {
+      // Show reports targeted at this branch OR general system reports
+      query = {
+        $or: [{ targetBranch: req.user.branch }, { scope: "general" }],
+      };
+    }
     const reports = await Report.find(query).sort({ createdAt: -1 }).limit(100);
     res.json(reports);
   } catch (error) {
@@ -2014,7 +2043,14 @@ app.put("/api/reports/:id/read", authMiddleware, async (req, res) => {
 // ========== NOTIFICATION SCHEDULES ==========
 app.get("/api/notification-schedules", authMiddleware, async (req, res) => {
   try {
-    res.json(await NotifSchedule.find().sort({ createdAt: -1 }));
+    let query = {};
+    if (req.user.role === "Branch Head Shepherd" && req.user.branch) {
+      // Branch shepherd sees only their own branch schedules
+      query = {
+        $or: [{ targetBranch: req.user.branch }, { createdBy: req.user._id }],
+      };
+    }
+    res.json(await NotifSchedule.find(query).sort({ createdAt: -1 }));
   } catch (error) {
     res.status(500).json({ error: "Server error" });
   }
@@ -2022,10 +2058,16 @@ app.get("/api/notification-schedules", authMiddleware, async (req, res) => {
 app.post(
   "/api/notification-schedules",
   authMiddleware,
-  roleMiddleware("Head Shepherd", "System Admin"),
+  roleMiddleware("Head Shepherd", "Branch Head Shepherd", "System Admin"),
   async (req, res) => {
     try {
-      const s = new NotifSchedule({ ...req.body, createdBy: req.user._id });
+      const schedData = { ...req.body, createdBy: req.user._id };
+      // Tag with branch for Branch Head Shepherd
+      if (req.user.role === "Branch Head Shepherd" && req.user.branch) {
+        schedData.targetBranch = req.user.branch;
+        schedData.targetScope = "branch";
+      }
+      const s = new NotifSchedule(schedData);
       await s.save();
       res.status(201).json(s);
     } catch (error) {
@@ -2036,14 +2078,24 @@ app.post(
 app.put(
   "/api/notification-schedules/:id",
   authMiddleware,
-  roleMiddleware("Head Shepherd", "System Admin"),
+  roleMiddleware("Head Shepherd", "Branch Head Shepherd", "System Admin"),
   async (req, res) => {
     try {
-      const s = await NotifSchedule.findByIdAndUpdate(req.params.id, req.body, {
-        new: true,
-      });
+      const s = await NotifSchedule.findById(req.params.id);
       if (!s) return res.status(404).json({ error: "Schedule not found" });
-      res.json(s);
+      // Branch Head Shepherd can only update their own branch's schedules
+      if (
+        req.user.role === "Branch Head Shepherd" &&
+        s.targetBranch !== req.user.branch &&
+        s.createdBy?.toString() !== req.user._id.toString()
+      )
+        return res.status(403).json({ error: "Access denied" });
+      const updated = await NotifSchedule.findByIdAndUpdate(
+        req.params.id,
+        req.body,
+        { new: true },
+      );
+      res.json(updated);
     } catch (error) {
       res.status(500).json({ error: "Server error" });
     }
@@ -2052,9 +2104,17 @@ app.put(
 app.delete(
   "/api/notification-schedules/:id",
   authMiddleware,
-  roleMiddleware("Head Shepherd", "System Admin"),
+  roleMiddleware("Head Shepherd", "Branch Head Shepherd", "System Admin"),
   async (req, res) => {
     try {
+      const s = await NotifSchedule.findById(req.params.id);
+      if (!s) return res.status(404).json({ error: "Schedule not found" });
+      if (
+        req.user.role === "Branch Head Shepherd" &&
+        s.targetBranch !== req.user.branch &&
+        s.createdBy?.toString() !== req.user._id.toString()
+      )
+        return res.status(403).json({ error: "Access denied" });
       await NotifSchedule.findByIdAndDelete(req.params.id);
       res.json({ message: "Schedule deleted" });
     } catch (error) {
@@ -2085,6 +2145,21 @@ app.get("/api/notifications", authMiddleware, async (req, res) => {
           { type: "report" },
         ],
       };
+    } else if (req.user.role === "Branch Head Shepherd" && req.user.branch) {
+      // Only see notifications relevant to their branch
+      const branchGroups = await Group.find({ branch: req.user.branch }).select(
+        "name",
+      );
+      const groupNames = branchGroups.map((g) => g.name);
+      query = {
+        $or: [
+          { targetBranch: req.user.branch },
+          { type: "group", targetGroup: { $in: groupNames } },
+          { type: "reminder", targetBranch: req.user.branch },
+          { type: "reminder", targetScope: "all" },
+          { sentBy: req.user._id },
+        ],
+      };
     }
     const notifications = await Notification.find(query)
       .sort({ createdAt: -1 })
@@ -2105,6 +2180,8 @@ app.post("/api/notifications", authMiddleware, async (req, res) => {
       req.body.type = "group";
       req.body.targetGroup = req.user.group;
     }
+    // Tag notification with sender's branch so recipients can filter
+    if (req.user.branch) req.body.targetBranch = req.user.branch;
     const notification = new Notification({
       ...req.body,
       sentBy: req.user._id,
@@ -2151,7 +2228,11 @@ app.delete("/api/notifications/:id", authMiddleware, async (req, res) => {
 // ========== MEDIA ROUTES ==========
 app.get("/api/media", authMiddleware, async (req, res) => {
   try {
-    res.json(await Media.find().sort({ createdAt: -1 }));
+    let query = {};
+    if (req.user.role === "Branch Head Shepherd" && req.user.branch) {
+      query.branch = req.user.branch;
+    }
+    res.json(await Media.find(query).sort({ createdAt: -1 }));
   } catch (e) {
     res.status(500).json({ error: "Server error" });
   }
@@ -2159,41 +2240,59 @@ app.get("/api/media", authMiddleware, async (req, res) => {
 app.post(
   "/api/media",
   authMiddleware,
-  mediaUpload.single("file"),
+  mediaUpload.array("files", 20),
   async (req, res) => {
     try {
       const { title, type, description } = req.body;
-      if (!title || !type)
-        return res.status(400).json({ error: "Title and type required" });
-      let fileInfo = {};
-      if (req.file) {
-        const cloudinaryUrl = await new Promise((resolve, reject) => {
-          const stream = cloudinary.uploader.upload_stream(
-            { folder: "mor-system/media", resource_type: "auto" },
-            (error, result) => {
-              if (error) return reject(error);
-              resolve(result.secure_url);
-            },
-          );
-          stream.end(req.file.buffer);
+      if (!type) return res.status(400).json({ error: "Type required" });
+      const files =
+        req.files && req.files.length ? req.files : req.file ? [req.file] : [];
+      if (!files.length && !title)
+        return res.status(400).json({ error: "Title and file required" });
+
+      const branch = req.user.branch || null;
+      const savedMedia = [];
+
+      // Support multiple files
+      const fileList = files.length ? files : [null];
+      for (let i = 0; i < fileList.length; i++) {
+        const file = fileList[i];
+        const mediaTitle =
+          files.length > 1 ? `${title || type} (${i + 1})` : title || type;
+        let fileInfo = {};
+        if (file) {
+          const cloudinaryUrl = await new Promise((resolve, reject) => {
+            const stream = cloudinary.uploader.upload_stream(
+              { folder: "mor-system/media", resource_type: "auto" },
+              (error, result) => {
+                if (error) return reject(error);
+                resolve(result.secure_url);
+              },
+            );
+            stream.end(file.buffer);
+          });
+          fileInfo = {
+            fileName: file.originalname,
+            filePath: cloudinaryUrl,
+            fileSize: file.size,
+            mimeType: file.mimetype,
+          };
+        }
+        const media = new Media({
+          title: mediaTitle,
+          type,
+          description,
+          branch,
+          ...fileInfo,
+          uploadedBy: req.user._id,
+          uploadedByName: req.user.fullName,
         });
-        fileInfo = {
-          fileName: req.file.originalname,
-          filePath: cloudinaryUrl,
-          fileSize: req.file.size,
-          mimeType: req.file.mimetype,
-        };
+        await media.save();
+        savedMedia.push(media);
       }
-      const media = new Media({
-        title,
-        type,
-        description,
-        ...fileInfo,
-        uploadedBy: req.user._id,
-        uploadedByName: req.user.fullName,
-      });
-      await media.save();
-      res.status(201).json(media);
+      res
+        .status(201)
+        .json(savedMedia.length === 1 ? savedMedia[0] : savedMedia);
     } catch (error) {
       res.status(500).json({ error: "Server error" });
     }
@@ -2214,8 +2313,15 @@ app.delete("/api/media/:id", authMiddleware, async (req, res) => {
 app.get("/api/activity-logs", authMiddleware, async (req, res) => {
   try {
     const { limit = 100 } = req.query;
+    let query = {};
+    // Branch Head Shepherd only sees activity from their own branch
+    if (req.user.role === "Branch Head Shepherd" && req.user.branch) {
+      query.branch = req.user.branch;
+    }
     res.json(
-      await ActivityLog.find().sort({ createdAt: -1 }).limit(parseInt(limit)),
+      await ActivityLog.find(query)
+        .sort({ createdAt: -1 })
+        .limit(parseInt(limit)),
     );
   } catch (error) {
     res.status(500).json({ error: "Server error" });
