@@ -1754,11 +1754,15 @@ app.post("/api/qr/scan/:token", authMiddleware, async (req, res) => {
         error: "Attendance registration is now closed for this session",
         expired: true,
       });
+
+    // Resolve the scanning member
     const member = await Member.findOne({ phoneNumber: req.user.phoneNumber });
     if (!member)
       return res
         .status(404)
         .json({ error: "Member record not found for your account" });
+
+    // Already scanned guard
     const alreadyScanned = session.scans.find(
       (s) => s.memberId?.toString() === member._id.toString(),
     );
@@ -1766,8 +1770,17 @@ app.post("/api/qr/scan/:token", authMiddleware, async (req, res) => {
       return res.status(409).json({
         error: "You have already scanned for this session",
         alreadyScanned: true,
+        memberName: member.fullName,
+        group: member.group,
+        membershipStatus: member.membershipStatus,
+        phoneNumber: member.phoneNumber,
+        timing: alreadyScanned.timing,
+        scanTime: alreadyScanned.scanTime,
       });
+
     const timing = isOnTime(session.type, now) ? "on_time" : "late";
+
+    // Add scan to QRSession
     session.scans.push({
       memberId: member._id,
       memberName: member.fullName,
@@ -1777,35 +1790,89 @@ app.post("/api/qr/scan/:token", authMiddleware, async (req, res) => {
       timing,
     });
     await session.save();
+
+    // ─── Write into the Attendance register ──────────────────────────────
     const dateStr = session.date.toISOString().split("T")[0];
+    // If session has no group (Head Shepherd QR) use the member's own group
+    const effectiveGroup = session.group || member.group;
+
     const attQuery =
       session.type === "cbs"
         ? {
             type: "cbs",
             cbsLocation: session.cbsLocation,
             date: {
-              $gte: new Date(dateStr + "T00:00:00"),
-              $lt: new Date(dateStr + "T23:59:59"),
+              $gte: new Date(dateStr + "T00:00:00.000Z"),
+              $lt: new Date(dateStr + "T23:59:59.999Z"),
             },
           }
         : {
             type: session.type,
-            group: session.group,
+            group: effectiveGroup,
             date: {
-              $gte: new Date(dateStr + "T00:00:00"),
-              $lt: new Date(dateStr + "T23:59:59"),
+              $gte: new Date(dateStr + "T00:00:00.000Z"),
+              $lt: new Date(dateStr + "T23:59:59.999Z"),
             },
           };
+
     let attendance = await Attendance.findOne(attQuery);
-    if (attendance) {
+
+    if (!attendance) {
+      // ── Create a brand-new attendance record for this session date ──────
+      // Seed it with all members of the effective group (all absent by default)
+      const groupMembers =
+        effectiveGroup
+          ? await Member.find({ group: effectiveGroup }).select("_id fullName")
+          : [];
+
+      const initialRecords = groupMembers.map((m) => ({
+        memberId: m._id,
+        memberName: m.fullName,
+        status: m._id.toString() === member._id.toString() ? "present" : "absent",
+        checkInTime: m._id.toString() === member._id.toString() ? now : null,
+        scanMethod: m._id.toString() === member._id.toString() ? "qr" : "manual",
+      }));
+
+      // If member not in group members list add them anyway
+      if (!groupMembers.find((m) => m._id.toString() === member._id.toString())) {
+        initialRecords.push({
+          memberId: member._id,
+          memberName: member.fullName,
+          status: "present",
+          checkInTime: now,
+          scanMethod: "qr",
+        });
+      }
+
+      const presentCount = initialRecords.filter((r) => r.status === "present").length;
+      attendance = new Attendance({
+        type: session.type,
+        group: effectiveGroup,
+        cbsLocation: session.cbsLocation || null,
+        branch: session.branch || member.branch || null,
+        date: session.date,
+        records: initialRecords,
+        stats: {
+          total: initialRecords.length,
+          present: presentCount,
+          absent: initialRecords.length - presentCount,
+          percentage: Math.round((presentCount / initialRecords.length) * 100),
+        },
+        recordedByName: "QR Scan",
+      });
+      await attendance.save();
+    } else {
+      // ── Update existing attendance record ────────────────────────────────
       const existingRecord = attendance.records.find(
-        (r) => r.memberName === member.fullName,
+        (r) =>
+          r.memberName === member.fullName ||
+          r.memberId?.toString() === member._id.toString(),
       );
       if (existingRecord) {
         existingRecord.status = "present";
         existingRecord.checkInTime = now;
         existingRecord.scanMethod = "qr";
-      } else
+      } else {
         attendance.records.push({
           memberId: member._id,
           memberName: member.fullName,
@@ -1813,6 +1880,7 @@ app.post("/api/qr/scan/:token", authMiddleware, async (req, res) => {
           checkInTime: now,
           scanMethod: "qr",
         });
+      }
       const presentCount = attendance.records.filter(
         (r) => r.status === "present",
       ).length;
@@ -1820,19 +1888,30 @@ app.post("/api/qr/scan/:token", authMiddleware, async (req, res) => {
         total: attendance.records.length,
         present: presentCount,
         absent: attendance.records.length - presentCount,
-        percentage: Math.round(
-          (presentCount / attendance.records.length) * 100,
-        ),
+        percentage: Math.round((presentCount / attendance.records.length) * 100),
       };
       await attendance.save();
     }
+
+    await logActivity(
+      `scanned QR attendance (${session.type}) — ${timing === "on_time" ? "on time" : "late"}`,
+      req.user,
+    );
+
     res.json({
-      message: `✅ Attendance recorded! You are ${timing === "on_time" ? "✅ On Time" : "⏰ Late"}`,
+      message: `Attendance recorded! You are ${timing === "on_time" ? "On Time" : "Late"}`,
       timing,
       memberName: member.fullName,
+      group: member.group || effectiveGroup,
+      membershipStatus: member.membershipStatus,
+      phoneNumber: member.phoneNumber,
       scanTime: now,
+      sessionType: session.type,
+      sessionDate: session.date,
+      cbsLocation: session.cbsLocation || null,
     });
   } catch (error) {
+    console.error("QR scan error:", error);
     res.status(500).json({ error: "Server error" });
   }
 });
