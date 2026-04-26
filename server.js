@@ -1687,17 +1687,52 @@ app.post(
       const { type, group, cbsLocation, date } = req.body;
       if (!type || !date)
         return res.status(400).json({ error: "type and date required" });
-      const token = crypto.randomBytes(24).toString("hex");
       const sessionDate = new Date(date);
+      const effectiveGroup = group || req.user.group;
+
+      // ── Check for an existing session for the same group+type+date ──────
+      const dateStr = sessionDate.toISOString().split("T")[0];
+      const existingQuery =
+        type === "cbs"
+          ? {
+              type,
+              group: effectiveGroup,
+              cbsLocation,
+              date: {
+                $gte: new Date(dateStr + "T00:00:00.000Z"),
+                $lt: new Date(dateStr + "T23:59:59.999Z"),
+              },
+            }
+          : {
+              type,
+              group: effectiveGroup,
+              date: {
+                $gte: new Date(dateStr + "T00:00:00.000Z"),
+                $lt: new Date(dateStr + "T23:59:59.999Z"),
+              },
+            };
+      const existing = await QRSession.findOne(existingQuery);
+      if (existing) {
+        const qrUrl = `${process.env.FRONTEND_URL || "https://mor-system-app.vercel.app"}/qr-scan.html?token=${existing.token}`;
+        return res.json({
+          token: existing.token,
+          qrUrl,
+          session: existing,
+          reused: true,
+        });
+      }
+
+      // ── No existing session — create a new one ───────────────────────────
       const expiresAt = getQRExpiry(type, date);
       if (new Date() > expiresAt)
         return res.status(400).json({
           error: "Registration time has already closed for this session",
         });
+      const token = crypto.randomBytes(24).toString("hex");
       const session = new QRSession({
         token,
         type,
-        group: group || req.user.group,
+        group: effectiveGroup,
         cbsLocation,
         branch: req.user.branch || "MOR Head Quarter",
         date: sessionDate,
@@ -1820,21 +1855,24 @@ app.post("/api/qr/scan/:token", authMiddleware, async (req, res) => {
     if (!attendance) {
       // ── Create a brand-new attendance record for this session date ──────
       // Seed it with all members of the effective group (all absent by default)
-      const groupMembers =
-        effectiveGroup
-          ? await Member.find({ group: effectiveGroup }).select("_id fullName")
-          : [];
+      const groupMembers = effectiveGroup
+        ? await Member.find({ group: effectiveGroup }).select("_id fullName")
+        : [];
 
       const initialRecords = groupMembers.map((m) => ({
         memberId: m._id,
         memberName: m.fullName,
-        status: m._id.toString() === member._id.toString() ? "present" : "absent",
+        status:
+          m._id.toString() === member._id.toString() ? "present" : "absent",
         checkInTime: m._id.toString() === member._id.toString() ? now : null,
-        scanMethod: m._id.toString() === member._id.toString() ? "qr" : "manual",
+        scanMethod:
+          m._id.toString() === member._id.toString() ? "qr" : "manual",
       }));
 
       // If member not in group members list add them anyway
-      if (!groupMembers.find((m) => m._id.toString() === member._id.toString())) {
+      if (
+        !groupMembers.find((m) => m._id.toString() === member._id.toString())
+      ) {
         initialRecords.push({
           memberId: member._id,
           memberName: member.fullName,
@@ -1844,7 +1882,9 @@ app.post("/api/qr/scan/:token", authMiddleware, async (req, res) => {
         });
       }
 
-      const presentCount = initialRecords.filter((r) => r.status === "present").length;
+      const presentCount = initialRecords.filter(
+        (r) => r.status === "present",
+      ).length;
       attendance = new Attendance({
         type: session.type,
         group: effectiveGroup,
@@ -1888,7 +1928,9 @@ app.post("/api/qr/scan/:token", authMiddleware, async (req, res) => {
         total: attendance.records.length,
         present: presentCount,
         absent: attendance.records.length - presentCount,
-        percentage: Math.round((presentCount / attendance.records.length) * 100),
+        percentage: Math.round(
+          (presentCount / attendance.records.length) * 100,
+        ),
       };
       await attendance.save();
     }
