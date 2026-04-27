@@ -2002,12 +2002,32 @@ app.get("/api/qr/sessions/:id", authMiddleware, async (req, res) => {
 app.get("/api/assignments", authMiddleware, async (req, res) => {
   try {
     let query = {};
-    if (req.user.role === "Group Leader") query.group = req.user.group;
-    else if (req.user.role === "Branch Head Shepherd")
-      query.branch = req.user.branch;
-    else if (req.user.role === "Member") query.assignedTo = req.user._id;
+
+    // Explicit query param overrides always take priority
+    if (req.query.memberId) query.member = req.query.memberId;
     if (req.query.assignedTo) query.assignedTo = req.query.assignedTo;
     if (req.query.group) query.group = req.query.group;
+
+    // Role-based defaults (only applied when no explicit params given)
+    if (!req.query.memberId && !req.query.assignedTo && !req.query.group) {
+      if (req.user.role === "Group Leader") {
+        query.group = req.user.group;
+      } else if (req.user.role === "Branch Head Shepherd") {
+        query.branch = req.user.branch;
+      } else {
+        // Member / Leader / Steward all log in with role "Member"
+        // Resolve their Member document so we have the correct _id
+        const memberDoc = await Member.findOne({
+          phoneNumber: req.user.phoneNumber,
+        })
+          .select("_id")
+          .lean();
+        const memberId = memberDoc?._id || req.user._id;
+        // Return assignments where they are the assigned member
+        query.member = memberId;
+      }
+    }
+
     const assignments = await Assignment.find(query).sort({ createdAt: -1 });
     res.json(assignments);
   } catch (error) {
@@ -2767,27 +2787,31 @@ app.post(
       if (!assignment)
         return res.status(404).json({ error: "Assignment not found" });
 
-      // Resolve sender/receiver from the assignment
+      // Resolve the sender's Member document for a reliable _id
       const senderMember = await Member.findOne({
         phoneNumber: req.user.phoneNumber,
       });
       const senderId = senderMember?._id || req.user._id;
       const senderName = req.user.fullName;
+      // Derive role from actual membership status, not login role
       const senderRole =
-        req.user.role === "Member"
-          ? "Member"
-          : req.user.role.includes("Leader")
-            ? "Leader"
-            : "Steward";
+        senderMember?.membershipStatus === "Leader"
+          ? "Leader"
+          : senderMember?.isSteward
+            ? "Steward"
+            : "Member";
 
-      // Determine the other party
+      // Determine direction by comparing sender ID against the assignment's member field
+      const senderIsTheMember =
+        assignment.member.toString() === senderId.toString();
+
       let toMemberId, toName;
-      if (req.user.role === "Member") {
-        // member → their leader/steward
+      if (senderIsTheMember) {
+        // The assigned member is sending → goes to their leader/steward
         toMemberId = assignment.assignedTo;
         toName = assignment.assignedToName;
       } else {
-        // leader/steward → the assigned member
+        // The leader/steward is sending → goes to the assigned member
         toMemberId = assignment.member;
         toName = assignment.memberName;
       }
@@ -2816,15 +2840,29 @@ app.put(
   authMiddleware,
   async (req, res) => {
     try {
-      const member = await Member.findOne({
+      const memberDoc = await Member.findOne({
         phoneNumber: req.user.phoneNumber,
+      })
+        .select("_id")
+        .lean();
+      const userId = memberDoc?._id || req.user._id;
+      const userIdStr = userId.toString();
+      // Fetch all messages and individually update those not yet read by this user
+      const msgs = await FollowUpChat.find({
+        assignmentId: req.params.assignmentId,
       });
-      const userId = member?._id || req.user._id;
-      await FollowUpChat.updateMany(
-        { assignmentId: req.params.assignmentId, readBy: { $ne: userId } },
-        { $push: { readBy: userId } },
-      );
-      res.json({ ok: true });
+      let updated = 0;
+      for (const msg of msgs) {
+        const alreadyRead = msg.readBy.some(
+          (id) => id.toString() === userIdStr,
+        );
+        if (!alreadyRead) {
+          msg.readBy.push(userId);
+          await msg.save();
+          updated++;
+        }
+      }
+      res.json({ ok: true, updated });
     } catch (e) {
       res.status(500).json({ error: "Server error" });
     }
@@ -2834,12 +2872,18 @@ app.put(
 // GET /api/followup-chat/unread-count  — total unread messages across all threads for current user
 app.get("/api/followup-chat/unread/count", authMiddleware, async (req, res) => {
   try {
-    const member = await Member.findOne({ phoneNumber: req.user.phoneNumber });
-    const userId = member?._id || req.user._id;
-    const count = await FollowUpChat.countDocuments({
-      toMemberId: userId,
-      readBy: { $ne: userId },
-    });
+    const memberDoc = await Member.findOne({
+      phoneNumber: req.user.phoneNumber,
+    })
+      .select("_id")
+      .lean();
+    const userId = memberDoc?._id || req.user._id;
+    const userIdStr = userId.toString();
+    // Count all messages addressed to this user that they haven't read yet
+    const allForMe = await FollowUpChat.find({ toMemberId: userId });
+    const count = allForMe.filter(
+      (m) => !m.readBy.some((id) => id.toString() === userIdStr),
+    ).length;
     res.json({ count });
   } catch (e) {
     res.status(500).json({ error: "Server error" });
