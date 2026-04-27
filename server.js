@@ -410,8 +410,23 @@ const Assignment = mongoose.model("Assignment", AssignmentSchema);
 const Report = mongoose.model("Report", ReportSchema);
 const NotifSchedule = mongoose.model("NotifSchedule", NotifScheduleSchema);
 const Notification = mongoose.model("Notification", NotificationSchema);
-const ActivityLog = mongoose.model("ActivityLog", ActivityLogSchema);
-const Media = mongoose.model("Media", MediaSchema);
+// FollowUp Chat Model
+const FollowUpChatSchema = new mongoose.Schema({
+  assignmentId: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: "Assignment",
+    required: true,
+  },
+  fromMemberId: { type: mongoose.Schema.Types.ObjectId, required: true },
+  fromName: { type: String, required: true },
+  fromRole: { type: String, default: "Member" }, // "Leader","Steward","Member"
+  toMemberId: { type: mongoose.Schema.Types.ObjectId, required: true },
+  toName: { type: String },
+  message: { type: String, required: true },
+  readBy: [{ type: mongoose.Schema.Types.ObjectId }],
+  createdAt: { type: Date, default: Date.now },
+});
+const FollowUpChat = mongoose.model("FollowUpChat", FollowUpChatSchema);
 
 // ========== AUTH MIDDLEWARE ==========
 const authMiddleware = async (req, res, next) => {
@@ -2715,6 +2730,121 @@ async function initializeDatabase() {
     console.error("❌ Database initialization error:", error);
   }
 }
+
+// ═══════════════════════════════════════════════════════════════
+// FOLLOW-UP CHAT ENDPOINTS
+// ═══════════════════════════════════════════════════════════════
+
+// GET  /api/followup-chat/:assignmentId  — fetch all messages for a thread
+app.get(
+  "/api/followup-chat/:assignmentId",
+  authMiddleware,
+  async (req, res) => {
+    try {
+      const assignment = await Assignment.findById(req.params.assignmentId);
+      if (!assignment)
+        return res.status(404).json({ error: "Assignment not found" });
+      const messages = await FollowUpChat.find({
+        assignmentId: req.params.assignmentId,
+      }).sort({ createdAt: 1 });
+      res.json(messages);
+    } catch (e) {
+      res.status(500).json({ error: "Server error" });
+    }
+  },
+);
+
+// POST /api/followup-chat/:assignmentId  — send a message
+app.post(
+  "/api/followup-chat/:assignmentId",
+  authMiddleware,
+  async (req, res) => {
+    try {
+      const { message } = req.body;
+      if (!message?.trim())
+        return res.status(400).json({ error: "Message required" });
+      const assignment = await Assignment.findById(req.params.assignmentId);
+      if (!assignment)
+        return res.status(404).json({ error: "Assignment not found" });
+
+      // Resolve sender/receiver from the assignment
+      const senderMember = await Member.findOne({
+        phoneNumber: req.user.phoneNumber,
+      });
+      const senderId = senderMember?._id || req.user._id;
+      const senderName = req.user.fullName;
+      const senderRole =
+        req.user.role === "Member"
+          ? "Member"
+          : req.user.role.includes("Leader")
+            ? "Leader"
+            : "Steward";
+
+      // Determine the other party
+      let toMemberId, toName;
+      if (req.user.role === "Member") {
+        // member → their leader/steward
+        toMemberId = assignment.assignedTo;
+        toName = assignment.assignedToName;
+      } else {
+        // leader/steward → the assigned member
+        toMemberId = assignment.member;
+        toName = assignment.memberName;
+      }
+
+      const msg = new FollowUpChat({
+        assignmentId: req.params.assignmentId,
+        fromMemberId: senderId,
+        fromName: senderName,
+        fromRole: senderRole,
+        toMemberId,
+        toName,
+        message: message.trim(),
+        readBy: [senderId], // sender has already read it
+      });
+      await msg.save();
+      res.status(201).json(msg);
+    } catch (e) {
+      res.status(500).json({ error: "Server error" });
+    }
+  },
+);
+
+// PUT /api/followup-chat/:assignmentId/read  — mark all messages in thread as read
+app.put(
+  "/api/followup-chat/:assignmentId/read",
+  authMiddleware,
+  async (req, res) => {
+    try {
+      const member = await Member.findOne({
+        phoneNumber: req.user.phoneNumber,
+      });
+      const userId = member?._id || req.user._id;
+      await FollowUpChat.updateMany(
+        { assignmentId: req.params.assignmentId, readBy: { $ne: userId } },
+        { $push: { readBy: userId } },
+      );
+      res.json({ ok: true });
+    } catch (e) {
+      res.status(500).json({ error: "Server error" });
+    }
+  },
+);
+
+// GET /api/followup-chat/unread-count  — total unread messages across all threads for current user
+app.get("/api/followup-chat/unread/count", authMiddleware, async (req, res) => {
+  try {
+    const member = await Member.findOne({ phoneNumber: req.user.phoneNumber });
+    const userId = member?._id || req.user._id;
+    const count = await FollowUpChat.countDocuments({
+      toMemberId: userId,
+      readBy: { $ne: userId },
+    });
+    res.json({ count });
+  } catch (e) {
+    res.status(500).json({ error: "Server error" });
+  }
+});
 
 const PORT = process.env.PORT || 5000;
 app.listen(PORT, "0.0.0.0", () => {
