@@ -2002,32 +2002,48 @@ app.get("/api/qr/sessions/:id", authMiddleware, async (req, res) => {
 app.get("/api/assignments", authMiddleware, async (req, res) => {
   try {
     let query = {};
-
-    // Explicit query param overrides always take priority
-    if (req.query.memberId) query.member = req.query.memberId;
-    if (req.query.assignedTo) query.assignedTo = req.query.assignedTo;
-    if (req.query.group) query.group = req.query.group;
-
-    // Role-based defaults (only applied when no explicit params given)
-    if (!req.query.memberId && !req.query.assignedTo && !req.query.group) {
-      if (req.user.role === "Group Leader") {
-        query.group = req.user.group;
-      } else if (req.user.role === "Branch Head Shepherd") {
-        query.branch = req.user.branch;
-      } else {
-        // Member / Leader / Steward all log in with role "Member"
-        // Resolve their Member document so we have the correct _id
-        const memberDoc = await Member.findOne({
-          phoneNumber: req.user.phoneNumber,
-        })
-          .select("_id")
-          .lean();
-        const memberId = memberDoc?._id || req.user._id;
-        // Return assignments where they are the assigned member
-        query.member = memberId;
+    if (req.user.role === "Group Leader") query.group = req.user.group;
+    else if (req.user.role === "Branch Head Shepherd")
+      query.branch = req.user.branch;
+    else if (req.user.role === "Member") {
+      // For ordinary members: show assignments where they are the member being followed up
+      // We match on BOTH User._id and Member._id (whichever was stored) and also by name
+      const memberRecord = await Member.findOne({
+        phoneNumber: req.user.phoneNumber,
+      });
+      const ids = [req.user._id];
+      if (
+        memberRecord &&
+        memberRecord._id.toString() !== req.user._id.toString()
+      ) {
+        ids.push(memberRecord._id);
       }
+      query.assignedTo = { $in: ids };
     }
-
+    // Explicit query overrides from request (for steward/leader fetching their assigned members)
+    if (req.query.assignedTo) {
+      // When a steward/leader queries their own assignments, resolve both User and Member IDs
+      const reqId = req.query.assignedTo;
+      const memberRecord = await Member.findById(reqId).catch(() => null);
+      const userRecord = await User.findById(reqId).catch(() => null);
+      const ids = [reqId];
+      if (memberRecord) {
+        // Also find the User record for this member
+        const linkedUser = await User.findOne({
+          phoneNumber: memberRecord.phoneNumber,
+        }).catch(() => null);
+        if (linkedUser) ids.push(linkedUser._id.toString());
+      }
+      if (userRecord) {
+        // Also find the Member record for this user
+        const linkedMember = await Member.findOne({
+          phoneNumber: userRecord.phoneNumber,
+        }).catch(() => null);
+        if (linkedMember) ids.push(linkedMember._id.toString());
+      }
+      query.assignedTo = { $in: [...new Set(ids)] };
+    }
+    if (req.query.group) query.group = req.query.group;
     const assignments = await Assignment.find(query).sort({ createdAt: -1 });
     res.json(assignments);
   } catch (error) {
@@ -2755,6 +2771,49 @@ async function initializeDatabase() {
 // FOLLOW-UP CHAT ENDPOINTS
 // ═══════════════════════════════════════════════════════════════
 
+// GET /api/followup-chat/unread-count  — total unread messages across all threads for current user
+app.get("/api/followup-chat/unread/count", authMiddleware, async (req, res) => {
+  try {
+    const member = await Member.findOne({ phoneNumber: req.user.phoneNumber });
+    const memberId = member?._id;
+    const userId = req.user._id;
+    const userName = req.user.fullName;
+
+    // Count messages unread by this user: match by toMemberId (both IDs) OR by toName
+    const idFilter = [];
+    if (memberId) idFilter.push(memberId);
+    if (userId) idFilter.push(userId);
+
+    const count = await FollowUpChat.countDocuments({
+      $or: [
+        { toMemberId: { $in: idFilter }, readBy: { $nin: idFilter } },
+        { toName: userName, fromName: { $ne: userName } },
+      ],
+    });
+
+    // Deduplicate: subtract messages already read by any of our IDs
+    // (The simple count above may overcount — use a safer aggregate)
+    const allUnread = await FollowUpChat.find({
+      $or: [
+        { toMemberId: { $in: idFilter } },
+        { toName: userName, fromName: { $ne: userName } },
+      ],
+    }).lean();
+
+    const actualUnread = allUnread.filter((m) => {
+      const readByStrs = (m.readBy || []).map((id) => id.toString());
+      return (
+        !readByStrs.includes(memberId?.toString()) &&
+        !readByStrs.includes(userId?.toString())
+      );
+    }).length;
+
+    res.json({ count: actualUnread });
+  } catch (e) {
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
 // GET  /api/followup-chat/:assignmentId  — fetch all messages for a thread
 app.get(
   "/api/followup-chat/:assignmentId",
@@ -2764,6 +2823,33 @@ app.get(
       const assignment = await Assignment.findById(req.params.assignmentId);
       if (!assignment)
         return res.status(404).json({ error: "Assignment not found" });
+
+      // Verify the requester has access to this chat thread
+      // Allow: the assigned member, the assignedTo leader/steward, group leaders, branch shepherds, head shepherds
+      const memberRecord = await Member.findOne({
+        phoneNumber: req.user.phoneNumber,
+      });
+      const memberId = memberRecord?._id?.toString();
+      const userId = req.user._id?.toString();
+      const hasAccess =
+        req.user.role === "Head Shepherd" ||
+        req.user.role === "Branch Head Shepherd" ||
+        req.user.role === "Group Leader" ||
+        assignment.memberName === req.user.fullName ||
+        assignment.assignedToName === req.user.fullName ||
+        (memberId &&
+          [
+            assignment.member?.toString(),
+            assignment.assignedTo?.toString(),
+          ].includes(memberId)) ||
+        (userId &&
+          [
+            assignment.member?.toString(),
+            assignment.assignedTo?.toString(),
+          ].includes(userId));
+
+      if (!hasAccess) return res.status(403).json({ error: "Access denied" });
+
       const messages = await FollowUpChat.find({
         assignmentId: req.params.assignmentId,
       }).sort({ createdAt: 1 });
@@ -2787,31 +2873,27 @@ app.post(
       if (!assignment)
         return res.status(404).json({ error: "Assignment not found" });
 
-      // Resolve the sender's Member document for a reliable _id
+      // Resolve sender's Member record for consistent ID tracking
       const senderMember = await Member.findOne({
         phoneNumber: req.user.phoneNumber,
       });
       const senderId = senderMember?._id || req.user._id;
       const senderName = req.user.fullName;
-      // Derive role from actual membership status, not login role
-      const senderRole =
-        senderMember?.membershipStatus === "Leader"
-          ? "Leader"
-          : senderMember?.isSteward
-            ? "Steward"
-            : "Member";
 
-      // Determine direction by comparing sender ID against the assignment's member field
-      const senderIsTheMember =
-        assignment.member.toString() === senderId.toString();
+      // Determine direction by matching sender name to assignment roles
+      // This handles all cases: member, steward, leader, group-leader
+      const isSenderTheMember = assignment.memberName === senderName;
+      const senderRole = isSenderTheMember
+        ? senderMember?.membershipStatus || "Member"
+        : senderMember?.membershipStatus || req.user.role;
 
       let toMemberId, toName;
-      if (senderIsTheMember) {
-        // The assigned member is sending → goes to their leader/steward
+      if (isSenderTheMember) {
+        // The person being followed up is sending → reply to their leader/steward
         toMemberId = assignment.assignedTo;
         toName = assignment.assignedToName;
       } else {
-        // The leader/steward is sending → goes to the assigned member
+        // The leader/steward is sending → directed at the assigned member
         toMemberId = assignment.member;
         toName = assignment.memberName;
       }
@@ -2840,56 +2922,26 @@ app.put(
   authMiddleware,
   async (req, res) => {
     try {
-      const memberDoc = await Member.findOne({
+      const member = await Member.findOne({
         phoneNumber: req.user.phoneNumber,
-      })
-        .select("_id")
-        .lean();
-      const userId = memberDoc?._id || req.user._id;
-      const userIdStr = userId.toString();
-      // Fetch all messages and individually update those not yet read by this user
-      const msgs = await FollowUpChat.find({
-        assignmentId: req.params.assignmentId,
       });
-      let updated = 0;
-      for (const msg of msgs) {
-        const alreadyRead = msg.readBy.some(
-          (id) => id.toString() === userIdStr,
-        );
-        if (!alreadyRead) {
-          msg.readBy.push(userId);
-          await msg.save();
-          updated++;
-        }
+      const memberId = member?._id;
+      const userId = req.user._id;
+      // Push both IDs to readBy to handle all possible stored ID variants
+      const idsToAdd = [userId];
+      if (memberId && memberId.toString() !== userId.toString()) {
+        idsToAdd.push(memberId);
       }
-      res.json({ ok: true, updated });
+      await FollowUpChat.updateMany(
+        { assignmentId: req.params.assignmentId },
+        { $addToSet: { readBy: { $each: idsToAdd } } },
+      );
+      res.json({ ok: true });
     } catch (e) {
       res.status(500).json({ error: "Server error" });
     }
   },
 );
-
-// GET /api/followup-chat/unread-count  — total unread messages across all threads for current user
-app.get("/api/followup-chat/unread/count", authMiddleware, async (req, res) => {
-  try {
-    const memberDoc = await Member.findOne({
-      phoneNumber: req.user.phoneNumber,
-    })
-      .select("_id")
-      .lean();
-    const userId = memberDoc?._id || req.user._id;
-    const userIdStr = userId.toString();
-    // Count all messages addressed to this user that they haven't read yet
-    const allForMe = await FollowUpChat.find({ toMemberId: userId });
-    const count = allForMe.filter(
-      (m) => !m.readBy.some((id) => id.toString() === userIdStr),
-    ).length;
-    res.json({ count });
-  } catch (e) {
-    res.status(500).json({ error: "Server error" });
-  }
-});
-
 const PORT = process.env.PORT || 5000;
 app.listen(PORT, "0.0.0.0", () => {
   console.log(`\n🚀 MOR System Backend Server v2.0`);
