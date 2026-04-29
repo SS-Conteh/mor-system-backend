@@ -820,6 +820,7 @@ app.get("/api/profile", authMiddleware, async (req, res) => {
       isBranchShepherd: user.isBranchShepherd || false,
       assignedTo: member?.assignedTo || null,
       assignedToName: member?.assignedToName || null,
+      userId: user._id,
     };
     res.json(profile);
   } catch (error) {
@@ -1703,7 +1704,10 @@ app.post(
       if (!type || !date)
         return res.status(400).json({ error: "type and date required" });
       const sessionDate = new Date(date);
-      const effectiveGroup = group || req.user.group;
+      // Allow null/empty group = "all groups" QR (Head Shepherd / Branch Shepherd)
+      // If group is explicitly sent as empty string keep it null so member's own group is used at scan time
+      const effectiveGroup =
+        group || (req.user.role === "Group Leader" ? req.user.group : null);
 
       // ── Check for an existing session for the same group+type+date ──────
       const dateStr = sessionDate.toISOString().split("T")[0];
@@ -1976,8 +1980,17 @@ app.post("/api/qr/scan/:token", authMiddleware, async (req, res) => {
 app.get("/api/qr/sessions", authMiddleware, async (req, res) => {
   try {
     let query = {};
-    if (req.user.role === "Group Leader") query.group = req.user.group;
-    else if (req.user.role === "Branch Head Shepherd")
+    if (req.user.role === "Group Leader") {
+      // Show sessions for the leader's own group AND any CBS sessions
+      // where members of their group have scanned (cross-group CBS)
+      query = {
+        $or: [
+          { group: req.user.group },
+          { group: null, branch: req.user.branch },
+          { type: "cbs", "scans.group": req.user.group },
+        ],
+      };
+    } else if (req.user.role === "Branch Head Shepherd")
       query.branch = req.user.branch;
     const sessions = await QRSession.find(query)
       .sort({ createdAt: -1 })
@@ -2005,9 +2018,10 @@ app.get("/api/assignments", authMiddleware, async (req, res) => {
     if (req.user.role === "Group Leader") query.group = req.user.group;
     else if (req.user.role === "Branch Head Shepherd")
       query.branch = req.user.branch;
-    else if (req.user.role === "Member") {
-      // For ordinary members: show assignments where they are the member being followed up
-      // We match on BOTH User._id and Member._id (whichever was stored) and also by name
+    else if (req.user.role === "Member" && !req.query.assignedTo) {
+      // Ordinary member viewing their own follow-up leader.
+      // Skip when ?assignedTo is passed — that means a steward/leader with Member role
+      // is fetching their own assigned members; the block below handles it.
       const memberRecord = await Member.findOne({
         phoneNumber: req.user.phoneNumber,
       });
@@ -2018,7 +2032,7 @@ app.get("/api/assignments", authMiddleware, async (req, res) => {
       ) {
         ids.push(memberRecord._id);
       }
-      query.assignedTo = { $in: ids };
+      query.member = { $in: ids };
     }
     // Explicit query overrides from request (for steward/leader fetching their assigned members)
     if (req.query.assignedTo) {
@@ -2506,9 +2520,14 @@ app.get("/api/activity-logs", authMiddleware, async (req, res) => {
   try {
     const { limit = 100 } = req.query;
     let query = {};
-    // Branch Head Shepherd only sees activity from their own branch
+    // Branch Head Shepherd sees their branch logs + any logs where branch is unset
     if (req.user.role === "Branch Head Shepherd" && req.user.branch) {
-      query.branch = req.user.branch;
+      query = {
+        $or: [{ branch: req.user.branch }, { branch: null }, { branch: "" }],
+      };
+    } else if (req.user.role === "Group Leader") {
+      // Group leaders see all logs — client filters by group member names
+      query = {};
     }
     res.json(
       await ActivityLog.find(query)
@@ -2771,49 +2790,6 @@ async function initializeDatabase() {
 // FOLLOW-UP CHAT ENDPOINTS
 // ═══════════════════════════════════════════════════════════════
 
-// GET /api/followup-chat/unread-count  — total unread messages across all threads for current user
-app.get("/api/followup-chat/unread/count", authMiddleware, async (req, res) => {
-  try {
-    const member = await Member.findOne({ phoneNumber: req.user.phoneNumber });
-    const memberId = member?._id;
-    const userId = req.user._id;
-    const userName = req.user.fullName;
-
-    // Count messages unread by this user: match by toMemberId (both IDs) OR by toName
-    const idFilter = [];
-    if (memberId) idFilter.push(memberId);
-    if (userId) idFilter.push(userId);
-
-    const count = await FollowUpChat.countDocuments({
-      $or: [
-        { toMemberId: { $in: idFilter }, readBy: { $nin: idFilter } },
-        { toName: userName, fromName: { $ne: userName } },
-      ],
-    });
-
-    // Deduplicate: subtract messages already read by any of our IDs
-    // (The simple count above may overcount — use a safer aggregate)
-    const allUnread = await FollowUpChat.find({
-      $or: [
-        { toMemberId: { $in: idFilter } },
-        { toName: userName, fromName: { $ne: userName } },
-      ],
-    }).lean();
-
-    const actualUnread = allUnread.filter((m) => {
-      const readByStrs = (m.readBy || []).map((id) => id.toString());
-      return (
-        !readByStrs.includes(memberId?.toString()) &&
-        !readByStrs.includes(userId?.toString())
-      );
-    }).length;
-
-    res.json({ count: actualUnread });
-  } catch (e) {
-    res.status(500).json({ error: "Server error" });
-  }
-});
-
 // GET  /api/followup-chat/:assignmentId  — fetch all messages for a thread
 app.get(
   "/api/followup-chat/:assignmentId",
@@ -2942,6 +2918,50 @@ app.put(
     }
   },
 );
+
+// GET /api/followup-chat/unread-count  — total unread messages across all threads for current user
+app.get("/api/followup-chat/unread/count", authMiddleware, async (req, res) => {
+  try {
+    const member = await Member.findOne({ phoneNumber: req.user.phoneNumber });
+    const memberId = member?._id;
+    const userId = req.user._id;
+    const userName = req.user.fullName;
+
+    // Count messages unread by this user: match by toMemberId (both IDs) OR by toName
+    const idFilter = [];
+    if (memberId) idFilter.push(memberId);
+    if (userId) idFilter.push(userId);
+
+    const count = await FollowUpChat.countDocuments({
+      $or: [
+        { toMemberId: { $in: idFilter }, readBy: { $nin: idFilter } },
+        { toName: userName, fromName: { $ne: userName } },
+      ],
+    });
+
+    // Deduplicate: subtract messages already read by any of our IDs
+    // (The simple count above may overcount — use a safer aggregate)
+    const allUnread = await FollowUpChat.find({
+      $or: [
+        { toMemberId: { $in: idFilter } },
+        { toName: userName, fromName: { $ne: userName } },
+      ],
+    }).lean();
+
+    const actualUnread = allUnread.filter((m) => {
+      const readByStrs = (m.readBy || []).map((id) => id.toString());
+      return (
+        !readByStrs.includes(memberId?.toString()) &&
+        !readByStrs.includes(userId?.toString())
+      );
+    }).length;
+
+    res.json({ count: actualUnread });
+  } catch (e) {
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
 const PORT = process.env.PORT || 5000;
 app.listen(PORT, "0.0.0.0", () => {
   console.log(`\n🚀 MOR System Backend Server v2.0`);
