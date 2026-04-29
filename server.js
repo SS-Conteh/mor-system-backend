@@ -2725,31 +2725,8 @@ async function initializeDatabase() {
         console.log(`   ✓ Created group: ${groupName}`);
       }
     }
-    const locations = [
-      "Brookfields",
-      "Tengbeh Town",
-      "Leicester",
-      "Regent",
-      "Kissy Road",
-      "Kissy Shell",
-      "Goderich",
-      "Murray Town",
-      "Saint John",
-      "Circular Road",
-      "Tree Planting",
-    ];
-    for (const location of locations) {
-      if (!(await CBSLocation.findOne({ name: location }))) {
-        await CBSLocation.create({
-          name: location,
-          branch: "MOR Head Quarter",
-          status: "Active",
-          memberCount: 0,
-          associatedGroups: groups,
-        });
-        console.log(`   ✓ Created CBS location: ${location}`);
-      }
-    }
+    // CBS locations are no longer seeded automatically.
+    // Each branch shepherd must register CBS locations manually via the dashboard.
     const defaultSchedules = [
       {
         title: "🙏 Fellowship Reminder",
