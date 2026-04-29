@@ -410,6 +410,8 @@ const Assignment = mongoose.model("Assignment", AssignmentSchema);
 const Report = mongoose.model("Report", ReportSchema);
 const NotifSchedule = mongoose.model("NotifSchedule", NotifScheduleSchema);
 const Notification = mongoose.model("Notification", NotificationSchema);
+const ActivityLog = mongoose.model("ActivityLog", ActivityLogSchema);
+const Media = mongoose.model("Media", MediaSchema);
 // FollowUp Chat Model
 const FollowUpChatSchema = new mongoose.Schema({
   assignmentId: {
