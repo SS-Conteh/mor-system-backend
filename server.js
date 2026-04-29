@@ -1469,11 +1469,11 @@ app.delete(
 );
 
 // ========== CBS LOCATIONS ==========
-app.get("/api/cbs-locations", authMiddleware, async (req, res) => {
+app.get("/api/cbs-locations", async (req, res) => {
   try {
     const query = {};
     if (req.query.branch) query.branch = req.query.branch;
-    else if (req.user.role === "Branch Head Shepherd")
+    else if (req.user?.role === "Branch Head Shepherd")
       query.branch = req.user.branch;
     res.json(await CBSLocation.find(query));
   } catch (error) {
