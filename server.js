@@ -897,7 +897,11 @@ app.get("/api/members", authMiddleware, async (req, res) => {
     const { group, status, search, steward, cbsLocation, branch, assignedTo } =
       req.query;
     let query = {};
-    const cbsOnly = req.query.cbsOnly === "true";
+    // cbsOnly=true allows bypassing the group filter ONLY for CBS Location Leaders,
+    // so they can see all members across groups at their assigned CBS location.
+    // Regular Group Leaders always stay scoped to their own group.
+    const cbsOnly =
+      req.query.cbsOnly === "true" && req.user.isCBSLeader === true;
     if (!cbsOnly && req.user.role === "Group Leader" && req.user.group)
       query.group = req.user.group;
     if (req.user.role === "Branch Head Shepherd" && req.user.branch)
