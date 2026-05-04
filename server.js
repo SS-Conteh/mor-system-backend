@@ -1914,7 +1914,11 @@ app.post("/api/qr/scan/:token", authMiddleware, async (req, res) => {
         type: session.type,
         group: effectiveGroup,
         cbsLocation: session.cbsLocation || null,
-        branch: session.branch || member.branch || null,
+        branch:
+          session.branch ||
+          member.branch ||
+          req.user.branch ||
+          "MOR Head Quarter",
         date: session.date,
         records: initialRecords,
         stats: {
@@ -1993,8 +1997,16 @@ app.get("/api/qr/sessions", authMiddleware, async (req, res) => {
       query = {
         $or: [{ group: req.user.group }, { "scans.group": req.user.group }],
       };
-    } else if (req.user.role === "Branch Head Shepherd")
-      query.branch = req.user.branch;
+    } else if (req.user.role === "Branch Head Shepherd") {
+      // Filter by branch if set, otherwise show sessions created by this user
+      if (req.user.branch) {
+        query = {
+          $or: [{ branch: req.user.branch }, { createdBy: req.user._id }],
+        };
+      } else {
+        query.createdBy = req.user._id;
+      }
+    }
     const sessions = await QRSession.find(query)
       .sort({ createdAt: -1 })
       .limit(50);
