@@ -431,6 +431,33 @@ const FollowUpChatSchema = new mongoose.Schema({
 });
 const FollowUpChat = mongoose.model("FollowUpChat", FollowUpChatSchema);
 
+// Excel Bulk Upload Log Model
+const ExcelUploadSchema = new mongoose.Schema({
+  uploadedBy: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: "User",
+    required: true,
+  },
+  uploadedByName: String,
+  group: String,
+  branch: String,
+  fileName: String,
+  totalRows: { type: Number, default: 0 },
+  savedCount: { type: Number, default: 0 },
+  skippedCount: { type: Number, default: 0 },
+  errorCount: { type: Number, default: 0 },
+  skippedDetails: [
+    {
+      row: Number,
+      name: String,
+      phone: String,
+      reason: String,
+    },
+  ],
+  createdAt: { type: Date, default: Date.now },
+});
+const ExcelUpload = mongoose.model("ExcelUpload", ExcelUploadSchema);
+
 // ========== AUTH MIDDLEWARE ==========
 const authMiddleware = async (req, res, next) => {
   try {
@@ -466,6 +493,23 @@ const upload = multer({
 const mediaUpload = multer({
   storage: multer.memoryStorage(),
   limits: { fileSize: 100 * 1024 * 1024 },
+});
+
+// Excel file upload config
+const excelUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 10 * 1024 * 1024 },
+  fileFilter: (req, file, cb) => {
+    const allowedMimes = [
+      "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+      "application/vnd.ms-excel",
+      "application/octet-stream",
+    ];
+    const allowedExt = /\.(xlsx|xls)$/i.test(file.originalname);
+    if (allowedMimes.includes(file.mimetype) || allowedExt)
+      return cb(null, true);
+    cb(new Error("Only Excel files (.xlsx, .xls) are allowed"));
+  },
 });
 
 app.use(
@@ -2982,6 +3026,277 @@ app.get("/api/followup-chat/unread/count", authMiddleware, async (req, res) => {
     res.status(500).json({ error: "Server error" });
   }
 });
+
+// ═══════════════════════════════════════════════════════════════
+// EXCEL BULK MEMBER IMPORT ENDPOINTS
+// ═══════════════════════════════════════════════════════════════
+
+/**
+ * POST /api/members/bulk-upload
+ * Accepts an Excel file (.xlsx / .xls) and bulk-creates Member + User records.
+ * Columns detected (case-insensitive, trimmed):
+ *   Full Name | Phone | Membership Status | Group | Gender | CBS Location (optional)
+ * All imported members receive the default password "member123".
+ */
+app.post(
+  "/api/members/bulk-upload",
+  authMiddleware,
+  roleMiddleware(
+    "Head Shepherd",
+    "Branch Head Shepherd",
+    "Group Leader",
+    "System Admin",
+  ),
+  excelUpload.single("excelFile"),
+  async (req, res) => {
+    try {
+      const XLSX = require("xlsx");
+      if (!req.file)
+        return res.status(400).json({ error: "No Excel file uploaded" });
+
+      // Parse the workbook from buffer
+      const workbook = XLSX.read(req.file.buffer, { type: "buffer" });
+      const sheetName = workbook.SheetNames[0];
+      const sheet = workbook.Sheets[sheetName];
+      const rows = XLSX.utils.sheet_to_json(sheet, { defval: "" });
+
+      if (!rows.length) {
+        return res
+          .status(400)
+          .json({ error: "The uploaded Excel file contains no data rows." });
+      }
+
+      const leaderGroup = req.user.group;
+      const leaderBranch = req.user.branch || "MOR Head Quarter";
+      const DEFAULT_PASSWORD = "member123";
+      const hashedPassword = await bcrypt.hash(DEFAULT_PASSWORD, 10);
+
+      const VALID_STATUSES = [
+        "First Timer",
+        "Inconsistent",
+        "Semi-Consistent",
+        "Consistent",
+        "Intense Leader",
+        "Discipleship",
+        "Leader",
+      ];
+
+      let savedCount = 0,
+        skippedCount = 0,
+        errorCount = 0;
+      const skippedDetails = [];
+      const savedMembers = [];
+
+      // Helper: normalize a row's keys to lowercase-trimmed for flexible column matching
+      const normalizeKeys = (obj) => {
+        const out = {};
+        Object.keys(obj).forEach((k) => {
+          out[
+            k
+              .trim()
+              .toLowerCase()
+              .replace(/[\s_]+/g, " ")
+          ] = obj[k];
+        });
+        return out;
+      };
+
+      // Helper: pull a value from a row by multiple possible column names
+      const pick = (r, ...keys) => {
+        for (const k of keys) {
+          const val = r[k.toLowerCase()];
+          if (val !== undefined && String(val).trim())
+            return String(val).trim();
+        }
+        return "";
+      };
+
+      for (let i = 0; i < rows.length; i++) {
+        const r = normalizeKeys(rows[i]);
+        const rowNum = i + 2; // row 1 is the header
+
+        const fullName = pick(r, "full name", "fullname", "name", "full_name");
+        const phone = pick(
+          r,
+          "phone",
+          "phone number",
+          "phonenumber",
+          "mobile",
+          "phone_number",
+        );
+        const rawStatus = pick(
+          r,
+          "membership status",
+          "status",
+          "membership_status",
+        );
+        const groupCol = pick(r, "group", "group name", "groupname");
+        const gender = pick(r, "gender", "sex");
+        const cbsLocation = pick(
+          r,
+          "cbs location",
+          "cbslocation",
+          "cbs",
+          "cbs_location",
+        );
+
+        // Validate required fields
+        if (!fullName || !phone) {
+          skippedDetails.push({
+            row: rowNum,
+            name: fullName || "(empty)",
+            phone: phone || "(empty)",
+            reason: "Missing Full Name or Phone",
+          });
+          skippedCount++;
+          continue;
+        }
+
+        // Check duplicates
+        const [existingUser, existingMember] = await Promise.all([
+          User.findOne({ phoneNumber: phone }),
+          Member.findOne({ phoneNumber: phone }),
+        ]);
+        if (existingUser || existingMember) {
+          skippedDetails.push({
+            row: rowNum,
+            name: fullName,
+            phone,
+            reason: "Phone number already registered",
+          });
+          skippedCount++;
+          continue;
+        }
+
+        const membershipStatus = VALID_STATUSES.includes(rawStatus)
+          ? rawStatus
+          : "First Timer";
+        const resolvedGroup = groupCol || leaderGroup || null;
+
+        try {
+          // Create login account
+          const user = new User({
+            fullName,
+            phoneNumber: phone,
+            password: hashedPassword,
+            role: "Member",
+            branch: leaderBranch,
+            group: resolvedGroup,
+            gender: gender || undefined,
+            cbsLocation: cbsLocation || undefined,
+            membershipStatus,
+          });
+          await user.save();
+
+          // Create member record
+          const member = new Member({
+            fullName,
+            phoneNumber: phone,
+            branch: leaderBranch,
+            group: resolvedGroup,
+            gender: gender || undefined,
+            cbsLocation: cbsLocation || undefined,
+            membershipStatus,
+            role: "Member",
+            addedBy: req.user._id,
+            addedByName: req.user.fullName,
+          });
+          await member.save();
+
+          // Increment group member count
+          if (resolvedGroup) {
+            await Group.findOneAndUpdate(
+              { name: resolvedGroup },
+              { $inc: { memberCount: 1 } },
+            );
+          }
+
+          savedCount++;
+          savedMembers.push({
+            fullName,
+            phone,
+            membershipStatus,
+            group: resolvedGroup,
+            gender,
+            cbsLocation,
+          });
+        } catch (rowErr) {
+          errorCount++;
+          skippedDetails.push({
+            row: rowNum,
+            name: fullName,
+            phone,
+            reason: rowErr.message,
+          });
+        }
+      }
+
+      // Persist upload log
+      await ExcelUpload.create({
+        uploadedBy: req.user._id,
+        uploadedByName: req.user.fullName,
+        group: leaderGroup,
+        branch: leaderBranch,
+        fileName: req.file.originalname,
+        totalRows: rows.length,
+        savedCount,
+        skippedCount,
+        errorCount,
+        skippedDetails,
+      });
+
+      await logActivity(
+        `bulk imported ${savedCount} member(s) via Excel`,
+        req.user,
+        `File: ${req.file.originalname} | Saved: ${savedCount} | Skipped: ${skippedCount} | Errors: ${errorCount}`,
+      );
+
+      res.json({
+        success: true,
+        totalRows: rows.length,
+        savedCount,
+        skippedCount,
+        errorCount,
+        skippedDetails,
+        savedMembers,
+      });
+    } catch (error) {
+      console.error("Bulk upload error:", error);
+      res
+        .status(500)
+        .json({ error: error.message || "Server error during bulk upload" });
+    }
+  },
+);
+
+/**
+ * GET /api/members/bulk-upload/history
+ * Returns the last 20 Excel upload logs.
+ * Group Leaders see only their own uploads; higher roles see all.
+ */
+app.get(
+  "/api/members/bulk-upload/history",
+  authMiddleware,
+  roleMiddleware(
+    "Head Shepherd",
+    "Branch Head Shepherd",
+    "Group Leader",
+    "System Admin",
+  ),
+  async (req, res) => {
+    try {
+      const filter =
+        req.user.role === "Group Leader" ? { uploadedBy: req.user._id } : {};
+      const uploads = await ExcelUpload.find(filter)
+        .sort({ createdAt: -1 })
+        .limit(20)
+        .lean();
+      res.json(uploads);
+    } catch (e) {
+      res.status(500).json({ error: "Server error" });
+    }
+  },
+);
 
 const PORT = process.env.PORT || 5000;
 app.listen(PORT, "0.0.0.0", () => {
