@@ -249,6 +249,7 @@ const QRSessionSchema = new mongoose.Schema({
       memberId: { type: mongoose.Schema.Types.ObjectId, ref: "Member" },
       memberName: String,
       group: String,
+      branch: { type: String, default: "MOR Head Quarter" },
       membershipStatus: String,
       scanTime: { type: Date, default: Date.now },
       timing: { type: String, enum: ["on_time", "late"], default: "on_time" },
@@ -1141,7 +1142,17 @@ app.get("/api/attendance", authMiddleware, async (req, res) => {
     } else if (req.user.role === "Group Leader" && req.user.group) {
       if (!group) query.group = req.user.group;
     } else if (req.user.role === "Branch Head Shepherd" && req.user.branch) {
-      if (!branch) query.branch = req.user.branch;
+      if (!branch) {
+        // Find all groups in this branch so QR-created records (which always
+        // have a group field set) are included even if their branch field is missing
+        const branchGroupDocs = await Member.distinct("group", {
+          branch: req.user.branch,
+        }).catch(() => []);
+        query.$or = [
+          { branch: req.user.branch },
+          { group: { $in: branchGroupDocs.filter(Boolean) } },
+        ];
+      }
     }
     const records = await Attendance.find(query).sort({ date: -1 }).lean();
     res.json(records);
@@ -1852,11 +1863,12 @@ app.post("/api/qr/scan/:token", authMiddleware, async (req, res) => {
 
     const timing = isOnTime(session.type, now) ? "on_time" : "late";
 
-    // Add scan to QRSession
+    // Add scan to QRSession — include member's branch so Branch Head Shepherd can filter
     session.scans.push({
       memberId: member._id,
       memberName: member.fullName,
       group: member.group,
+      branch: member.branch || req.user.branch || "MOR Head Quarter",
       membershipStatus: member.membershipStatus,
       scanTime: now,
       timing,
@@ -2010,10 +2022,15 @@ app.get("/api/qr/sessions", authMiddleware, async (req, res) => {
         $or: [{ group: req.user.group }, { "scans.group": req.user.group }],
       };
     } else if (req.user.role === "Branch Head Shepherd") {
-      // Filter by branch if set, otherwise show sessions created by this user
+      // Show sessions created by this branch, created by this user,
+      // OR any session where a member from this branch has scanned
       if (req.user.branch) {
         query = {
-          $or: [{ branch: req.user.branch }, { createdBy: req.user._id }],
+          $or: [
+            { branch: req.user.branch },
+            { createdBy: req.user._id },
+            { "scans.branch": req.user.branch },
+          ],
         };
       } else {
         query.createdBy = req.user._id;
