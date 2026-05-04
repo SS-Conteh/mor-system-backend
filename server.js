@@ -1715,9 +1715,17 @@ app.post(
       const effectiveGroup =
         group || (req.user.role === "Group Leader" ? req.user.group : null);
 
-      // ── Check for an existing session for the same group+type+date ──────
+      // ── Check for an existing session for the same group+type+date+branch ──
+      // Scope to the user's own branch so Branch Head Shepherds never accidentally
+      // reuse a session from a different branch (which would then not appear in
+      // their Recent QR Sessions list because createdBy/branch won't match).
       const dateStr = sessionDate.toISOString().split("T")[0];
-      const existingQuery =
+      const branchScope =
+        req.user.role !== "Head Shepherd" && req.user.role !== "System Admin"
+          ? req.user.branch || null
+          : undefined; // Head Shepherd / System Admin: no branch scope on reuse lookup
+
+      const existingQueryBase =
         type === "cbs"
           ? {
               type,
@@ -1736,7 +1744,11 @@ app.post(
                 $lt: new Date(dateStr + "T23:59:59.999Z"),
               },
             };
-      const existing = await QRSession.findOne(existingQuery);
+      // Add branch scope for non-Head-Shepherd roles
+      if (branchScope !== undefined) {
+        existingQueryBase.branch = branchScope;
+      }
+      const existing = await QRSession.findOne(existingQueryBase);
       if (existing) {
         const qrUrl = `${process.env.FRONTEND_URL || "https://mor-system-app.vercel.app"}/qr-scan.html?token=${existing.token}`;
         return res.json({
