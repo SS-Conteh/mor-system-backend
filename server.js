@@ -3406,10 +3406,8 @@ app.get(
         const activeSections =
           (f.total > 0 ? 1 : 0) + (c.total > 0 ? 1 : 0) + (e.total > 0 ? 1 : 0);
         if (!activeSections) return;
-        // Weighted composite: Fellowship 40%, CBS 35%, Evangelism 25%
-        const composite = parseFloat(
-          (fP * 0.4 + cP * 0.35 + eP * 0.25).toFixed(1),
-        );
+        // Simple average: (Fellowship% + CBS% + Evangelism%) / 3
+        const composite = parseFloat(((fP + cP + eP) / 3).toFixed(1));
         groupLeaderboard.push({
           name: g,
           composite,
@@ -3499,19 +3497,22 @@ app.get(
           const gf = fGS[g] || { present: 0, total: 0 };
           const gc = cGS[g] || { present: 0, total: 0 };
           const ge = eGS[g] || { present: 0, total: 0 };
+          // Simple average: (Fellowship% + CBS% + Evangelism%) / 3
           groupComposite = parseFloat(
             (
-              pct(gf.present, gf.total) * 0.4 +
-              pct(gc.present, gc.total) * 0.35 +
-              pct(ge.present, ge.total) * 0.25
+              (pct(gf.present, gf.total) +
+                pct(gc.present, gc.total) +
+                pct(ge.present, ge.total)) /
+              3
             ).toFixed(1),
           );
         }
         const ownPct = pct(ownPresent, ownTotal);
+        // Leader score: average of own attendance % and group composite %
         const composite = parseFloat(
           (ownTotal > 0
-            ? ownPct * 0.4 + groupComposite * 0.6
-            : groupComposite * 0.6
+            ? (ownPct + groupComposite) / 2
+            : groupComposite
           ).toFixed(1),
         );
         leaderLeaderboard.push({
