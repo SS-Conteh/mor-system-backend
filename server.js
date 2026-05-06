@@ -431,32 +431,24 @@ const FollowUpChatSchema = new mongoose.Schema({
 });
 const FollowUpChat = mongoose.model("FollowUpChat", FollowUpChatSchema);
 
-// Excel Bulk Upload Log Model
-const ExcelUploadSchema = new mongoose.Schema({
+// Bulk Import Log Model — tracks every excel upload by group leaders
+const BulkImportSchema = new mongoose.Schema({
   uploadedBy: {
     type: mongoose.Schema.Types.ObjectId,
     ref: "User",
     required: true,
   },
-  uploadedByName: String,
-  group: String,
-  branch: String,
-  fileName: String,
+  uploadedByName: { type: String, required: true },
+  group: { type: String, required: true },
+  branch: { type: String, default: "MOR Head Quarter" },
+  fileName: { type: String, required: true },
   totalRows: { type: Number, default: 0 },
-  savedCount: { type: Number, default: 0 },
+  successCount: { type: Number, default: 0 },
   skippedCount: { type: Number, default: 0 },
-  errorCount: { type: Number, default: 0 },
-  skippedDetails: [
-    {
-      row: Number,
-      name: String,
-      phone: String,
-      reason: String,
-    },
-  ],
+  skippedDetails: [{ phone: String, name: String, reason: String }],
   createdAt: { type: Date, default: Date.now },
 });
-const ExcelUpload = mongoose.model("ExcelUpload", ExcelUploadSchema);
+const BulkImport = mongoose.model("BulkImport", BulkImportSchema);
 
 // ========== AUTH MIDDLEWARE ==========
 const authMiddleware = async (req, res, next) => {
@@ -494,21 +486,18 @@ const mediaUpload = multer({
   storage: multer.memoryStorage(),
   limits: { fileSize: 100 * 1024 * 1024 },
 });
-
-// Excel file upload config
 const excelUpload = multer({
   storage: multer.memoryStorage(),
   limits: { fileSize: 10 * 1024 * 1024 },
   fileFilter: (req, file, cb) => {
-    const allowedMimes = [
-      "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-      "application/vnd.ms-excel",
-      "application/octet-stream",
-    ];
-    const allowedExt = /\.(xlsx|xls)$/i.test(file.originalname);
-    if (allowedMimes.includes(file.mimetype) || allowedExt)
-      return cb(null, true);
-    cb(new Error("Only Excel files (.xlsx, .xls) are allowed"));
+    const ok =
+      file.mimetype ===
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" ||
+      file.mimetype === "application/vnd.ms-excel" ||
+      file.originalname.endsWith(".xlsx") ||
+      file.originalname.endsWith(".xls");
+    if (ok) return cb(null, true);
+    cb(new Error("Only Excel files (.xlsx / .xls) are allowed"));
   },
 });
 
@@ -1054,6 +1043,240 @@ app.put("/api/members/:id", authMiddleware, async (req, res) => {
     await logActivity(`updated member ${member.fullName}`, req.user);
     res.json(updatedMember);
   } catch (error) {
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+// ── BULK IMPORT: POST /api/members/import-excel ──────────────────────────────
+// Accepts an .xlsx/.xls file, parses columns:
+//   Full Name | Phone | Membership Status | Group | Gender | CBS Location (optional)
+// Creates both Member + User records (password = "member123") for each row.
+// Skips rows where the phone number already exists. Logs the upload.
+app.post(
+  "/api/members/import-excel",
+  authMiddleware,
+  roleMiddleware(
+    "Head Shepherd",
+    "Branch Head Shepherd",
+    "Group Leader",
+    "System Admin",
+  ),
+  excelUpload.single("excelFile"),
+  async (req, res) => {
+    try {
+      if (!req.file)
+        return res.status(400).json({ error: "No Excel file uploaded" });
+
+      // Dynamically require xlsx so the rest of the server still works if xlsx not installed
+      let XLSX;
+      try {
+        XLSX = require("xlsx");
+      } catch (e) {
+        return res.status(500).json({
+          error: "xlsx package not installed on server. Run: npm install xlsx",
+        });
+      }
+
+      const workbook = XLSX.read(req.file.buffer, { type: "buffer" });
+      const sheetName = workbook.SheetNames[0];
+      const sheet = workbook.Sheets[sheetName];
+      const rows = XLSX.utils.sheet_to_json(sheet, { defval: "" });
+
+      if (!rows.length)
+        return res
+          .status(400)
+          .json({ error: "Excel file is empty or has no data rows" });
+
+      const DEFAULT_PASSWORD = "member123";
+      const hashedPassword = await bcrypt.hash(DEFAULT_PASSWORD, 10);
+
+      const leaderGroup = req.user.group;
+      const leaderBranch = req.user.branch || "MOR Head Quarter";
+
+      const VALID_STATUSES = [
+        "First Timer",
+        "Inconsistent",
+        "Semi-Consistent",
+        "Consistent",
+        "Intense Leader",
+        "Discipleship",
+        "Leader",
+      ];
+
+      // Normalise a header string: trim, lowercase, strip spaces/underscores
+      const norm = (s) =>
+        String(s || "")
+          .trim()
+          .toLowerCase()
+          .replace(/[\s_-]+/g, "");
+
+      // Map columns by normalised header name
+      const colMap = {};
+      if (rows.length) {
+        Object.keys(rows[0]).forEach((k) => {
+          colMap[norm(k)] = k;
+        });
+      }
+
+      const getCol = (row, ...aliases) => {
+        for (const a of aliases) {
+          const raw = colMap[norm(a)];
+          if (
+            raw !== undefined &&
+            row[raw] !== undefined &&
+            String(row[raw]).trim() !== ""
+          ) {
+            return String(row[raw]).trim();
+          }
+        }
+        return "";
+      };
+
+      let successCount = 0;
+      const skippedDetails = [];
+
+      for (const row of rows) {
+        const fullName = getCol(
+          row,
+          "Full Name",
+          "FullName",
+          "Name",
+          "full name",
+        );
+        const phone = getCol(
+          row,
+          "Phone",
+          "Phone Number",
+          "PhoneNumber",
+          "phone",
+        );
+        const rawStatus = getCol(
+          row,
+          "Membership Status",
+          "MembershipStatus",
+          "Status",
+        );
+        const group = getCol(row, "Group") || leaderGroup;
+        const gender = getCol(row, "Gender");
+        const cbsLocation = getCol(row, "CBS Location", "CBSLocation", "cbs");
+
+        if (!fullName || !phone) {
+          skippedDetails.push({
+            phone: phone || "—",
+            name: fullName || "—",
+            reason: "Missing Full Name or Phone",
+          });
+          continue;
+        }
+
+        // Clean phone: digits only for uniqueness check
+        const cleanPhone = phone.replace(/\s+/g, "");
+
+        // Skip if phone already registered in User or Member
+        const existingUser = await User.findOne({ phoneNumber: cleanPhone });
+        const existingMember = await Member.findOne({
+          phoneNumber: cleanPhone,
+        });
+        if (existingUser || existingMember) {
+          skippedDetails.push({
+            phone: cleanPhone,
+            name: fullName,
+            reason: "Phone already registered",
+          });
+          continue;
+        }
+
+        // Validate / default membership status
+        const membershipStatus = VALID_STATUSES.includes(rawStatus)
+          ? rawStatus
+          : "First Timer";
+
+        // Scope group: if GL, always use their own group
+        const assignedGroup =
+          req.user.role === "Group Leader" ? leaderGroup : group || leaderGroup;
+
+        // Create User account (so the member can log in)
+        const newUser = new User({
+          fullName,
+          phoneNumber: cleanPhone,
+          password: hashedPassword,
+          role: "Member",
+          branch: leaderBranch,
+          group: assignedGroup || null,
+          gender: gender || undefined,
+          cbsLocation: cbsLocation || undefined,
+          membershipStatus,
+        });
+        await newUser.save();
+
+        // Create Member record
+        const newMember = new Member({
+          fullName,
+          phoneNumber: cleanPhone,
+          branch: leaderBranch,
+          group: assignedGroup || null,
+          gender: gender || undefined,
+          cbsLocation: cbsLocation || undefined,
+          membershipStatus,
+          addedBy: req.user._id,
+          addedByName: req.user.fullName,
+        });
+        await newMember.save();
+
+        // Increment group member count
+        if (assignedGroup) {
+          await Group.findOneAndUpdate(
+            { name: assignedGroup },
+            { $inc: { memberCount: 1 } },
+          );
+        }
+
+        successCount++;
+      }
+
+      // Log the import
+      await BulkImport.create({
+        uploadedBy: req.user._id,
+        uploadedByName: req.user.fullName,
+        group: leaderGroup || "N/A",
+        branch: leaderBranch,
+        fileName: req.file.originalname,
+        totalRows: rows.length,
+        successCount,
+        skippedCount: skippedDetails.length,
+        skippedDetails,
+      });
+
+      await logActivity(
+        `bulk-imported ${successCount} members from Excel (${req.file.originalname})`,
+        req.user,
+      );
+
+      res.json({
+        message: `Import complete. ${successCount} member(s) added, ${skippedDetails.length} skipped.`,
+        successCount,
+        skippedCount: skippedDetails.length,
+        skipped: skippedDetails,
+      });
+    } catch (error) {
+      console.error("Excel import error:", error);
+      res
+        .status(500)
+        .json({ error: error.message || "Server error during import" });
+    }
+  },
+);
+
+// ── GET /api/members/import-history — list past bulk imports for this leader ──
+app.get("/api/members/import-history", authMiddleware, async (req, res) => {
+  try {
+    const query =
+      req.user.role === "Group Leader" ? { uploadedBy: req.user._id } : {};
+    const history = await BulkImport.find(query)
+      .sort({ createdAt: -1 })
+      .limit(20);
+    res.json(history);
+  } catch (e) {
     res.status(500).json({ error: "Server error" });
   }
 });
@@ -3028,272 +3251,346 @@ app.get("/api/followup-chat/unread/count", authMiddleware, async (req, res) => {
 });
 
 // ═══════════════════════════════════════════════════════════════
-// EXCEL BULK MEMBER IMPORT ENDPOINTS
+// COMPREHENSIVE REPORT ENDPOINT
+// GET /api/comprehensive-report?branch=...&quarter=Q1|Q2|Q3|Q4|all
 // ═══════════════════════════════════════════════════════════════
-
-/**
- * POST /api/members/bulk-upload
- * Accepts an Excel file (.xlsx / .xls) and bulk-creates Member + User records.
- * Columns detected (case-insensitive, trimmed):
- *   Full Name | Phone | Membership Status | Group | Gender | CBS Location (optional)
- * All imported members receive the default password "member123".
- */
-app.post(
-  "/api/members/bulk-upload",
+app.get(
+  "/api/comprehensive-report",
   authMiddleware,
-  roleMiddleware(
-    "Head Shepherd",
-    "Branch Head Shepherd",
-    "Group Leader",
-    "System Admin",
-  ),
-  excelUpload.single("excelFile"),
+  roleMiddleware("Head Shepherd", "Branch Head Shepherd", "System Admin"),
   async (req, res) => {
     try {
-      const XLSX = require("xlsx");
-      if (!req.file)
-        return res.status(400).json({ error: "No Excel file uploaded" });
+      const { branch, quarter } = req.query;
+      const year = new Date().getFullYear();
 
-      // Parse the workbook from buffer
-      const workbook = XLSX.read(req.file.buffer, { type: "buffer" });
-      const sheetName = workbook.SheetNames[0];
-      const sheet = workbook.Sheets[sheetName];
-      const rows = XLSX.utils.sheet_to_json(sheet, { defval: "" });
-
-      if (!rows.length) {
-        return res
-          .status(400)
-          .json({ error: "The uploaded Excel file contains no data rows." });
+      // ── Quarter date range ──
+      const qDefs = {
+        Q1: {
+          start: new Date(year, 0, 1),
+          end: new Date(year, 3, 0, 23, 59, 59, 999),
+          label: `Q1 ${year} (Jan – Mar)`,
+        },
+        Q2: {
+          start: new Date(year, 3, 1),
+          end: new Date(year, 6, 0, 23, 59, 59, 999),
+          label: `Q2 ${year} (Apr – Jun)`,
+        },
+        Q3: {
+          start: new Date(year, 6, 1),
+          end: new Date(year, 9, 0, 23, 59, 59, 999),
+          label: `Q3 ${year} (Jul – Sep)`,
+        },
+        Q4: {
+          start: new Date(year, 9, 1),
+          end: new Date(year + 1, 0, 0, 23, 59, 59, 999),
+          label: `Q4 ${year} (Oct – Dec)`,
+        },
+      };
+      let dateFilter = {};
+      let quarterLabel = "All Time";
+      if (quarter && qDefs[quarter]) {
+        dateFilter.date = {
+          $gte: qDefs[quarter].start,
+          $lte: qDefs[quarter].end,
+        };
+        quarterLabel = qDefs[quarter].label;
       }
 
-      const leaderGroup = req.user.group;
-      const leaderBranch = req.user.branch || "MOR Head Quarter";
-      const DEFAULT_PASSWORD = "member123";
-      const hashedPassword = await bcrypt.hash(DEFAULT_PASSWORD, 10);
-
-      const VALID_STATUSES = [
-        "First Timer",
-        "Inconsistent",
-        "Semi-Consistent",
-        "Consistent",
-        "Intense Leader",
-        "Discipleship",
-        "Leader",
-      ];
-
-      let savedCount = 0,
-        skippedCount = 0,
-        errorCount = 0;
-      const skippedDetails = [];
-      const savedMembers = [];
-
-      // Helper: normalize a row's keys to lowercase-trimmed for flexible column matching
-      const normalizeKeys = (obj) => {
-        const out = {};
-        Object.keys(obj).forEach((k) => {
-          out[
-            k
-              .trim()
-              .toLowerCase()
-              .replace(/[\s_]+/g, " ")
-          ] = obj[k];
+      // ── Branch scope ──
+      const targetBranch = branch && branch !== "all" ? branch : null;
+      let branchGroupNames = [];
+      if (targetBranch) {
+        branchGroupNames = await Group.distinct("name", {
+          branch: targetBranch,
         });
-        return out;
-      };
-
-      // Helper: pull a value from a row by multiple possible column names
-      const pick = (r, ...keys) => {
-        for (const k of keys) {
-          const val = r[k.toLowerCase()];
-          if (val !== undefined && String(val).trim())
-            return String(val).trim();
-        }
-        return "";
-      };
-
-      for (let i = 0; i < rows.length; i++) {
-        const r = normalizeKeys(rows[i]);
-        const rowNum = i + 2; // row 1 is the header
-
-        const fullName = pick(r, "full name", "fullname", "name", "full_name");
-        const phone = pick(
-          r,
-          "phone",
-          "phone number",
-          "phonenumber",
-          "mobile",
-          "phone_number",
-        );
-        const rawStatus = pick(
-          r,
-          "membership status",
-          "status",
-          "membership_status",
-        );
-        const groupCol = pick(r, "group", "group name", "groupname");
-        const gender = pick(r, "gender", "sex");
-        const cbsLocation = pick(
-          r,
-          "cbs location",
-          "cbslocation",
-          "cbs",
-          "cbs_location",
-        );
-
-        // Validate required fields
-        if (!fullName || !phone) {
-          skippedDetails.push({
-            row: rowNum,
-            name: fullName || "(empty)",
-            phone: phone || "(empty)",
-            reason: "Missing Full Name or Phone",
-          });
-          skippedCount++;
-          continue;
-        }
-
-        // Check duplicates
-        const [existingUser, existingMember] = await Promise.all([
-          User.findOne({ phoneNumber: phone }),
-          Member.findOne({ phoneNumber: phone }),
-        ]);
-        if (existingUser || existingMember) {
-          skippedDetails.push({
-            row: rowNum,
-            name: fullName,
-            phone,
-            reason: "Phone number already registered",
-          });
-          skippedCount++;
-          continue;
-        }
-
-        const membershipStatus = VALID_STATUSES.includes(rawStatus)
-          ? rawStatus
-          : "First Timer";
-        const resolvedGroup = groupCol || leaderGroup || null;
-
-        try {
-          // Create login account
-          const user = new User({
-            fullName,
-            phoneNumber: phone,
-            password: hashedPassword,
-            role: "Member",
-            branch: leaderBranch,
-            group: resolvedGroup,
-            gender: gender || undefined,
-            cbsLocation: cbsLocation || undefined,
-            membershipStatus,
-          });
-          await user.save();
-
-          // Create member record
-          const member = new Member({
-            fullName,
-            phoneNumber: phone,
-            branch: leaderBranch,
-            group: resolvedGroup,
-            gender: gender || undefined,
-            cbsLocation: cbsLocation || undefined,
-            membershipStatus,
-            role: "Member",
-            addedBy: req.user._id,
-            addedByName: req.user.fullName,
-          });
-          await member.save();
-
-          // Increment group member count
-          if (resolvedGroup) {
-            await Group.findOneAndUpdate(
-              { name: resolvedGroup },
-              { $inc: { memberCount: 1 } },
-            );
-          }
-
-          savedCount++;
-          savedMembers.push({
-            fullName,
-            phone,
-            membershipStatus,
-            group: resolvedGroup,
-            gender,
-            cbsLocation,
-          });
-        } catch (rowErr) {
-          errorCount++;
-          skippedDetails.push({
-            row: rowNum,
-            name: fullName,
-            phone,
-            reason: rowErr.message,
-          });
-        }
       }
 
-      // Persist upload log
-      await ExcelUpload.create({
-        uploadedBy: req.user._id,
-        uploadedByName: req.user.fullName,
-        group: leaderGroup,
-        branch: leaderBranch,
-        fileName: req.file.originalname,
-        totalRows: rows.length,
-        savedCount,
-        skippedCount,
-        errorCount,
-        skippedDetails,
-      });
+      // ── Fetch attendance records ──
+      const baseQuery = { ...dateFilter };
+      if (targetBranch) {
+        baseQuery.$or = [
+          { branch: targetBranch },
+          { group: { $in: branchGroupNames } },
+        ];
+      }
+      const allAtt = await Attendance.find(baseQuery).lean();
 
-      await logActivity(
-        `bulk imported ${savedCount} member(s) via Excel`,
-        req.user,
-        `File: ${req.file.originalname} | Saved: ${savedCount} | Skipped: ${skippedCount} | Errors: ${errorCount}`,
-      );
+      const byType = {
+        fellowship: allAtt.filter((a) => a.type === "fellowship"),
+        cbs: allAtt.filter((a) => a.type === "cbs"),
+        evangelism: allAtt.filter((a) => a.type === "evangelism"),
+      };
+
+      // ── Helpers ──
+      const pct = (p, t) =>
+        t > 0 ? parseFloat(((p / t) * 100).toFixed(1)) : 0;
+
+      // Build per-member stats from a set of sessions
+      // memberBranch enrichment: each session carries branch + group so we can attach it
+      const buildMemberStats = (sessions) => {
+        const map = {};
+        sessions.forEach((s) => {
+          (s.records || []).forEach((r) => {
+            const key = r.memberId?.toString() || r.memberName;
+            if (!key) return;
+            if (!map[key]) {
+              map[key] = {
+                id: key,
+                name: r.memberName,
+                present: 0,
+                absent: 0,
+                group: s.group || null,
+                branch: s.branch || null,
+              };
+            }
+            r.status === "present" ? map[key].present++ : map[key].absent++;
+          });
+        });
+        return Object.values(map);
+      };
+
+      // Build per-group attendance stats from sessions
+      const buildGroupStats = (sessions) => {
+        const map = {};
+        sessions.forEach((s) => {
+          const g = s.group || "__unassigned__";
+          if (!map[g]) map[g] = { present: 0, total: 0 };
+          (s.records || []).forEach((r) => {
+            map[g].total++;
+            if (r.status === "present") map[g].present++;
+          });
+        });
+        return map;
+      };
+
+      // Pick ALL winners (ties allowed): zero-absent first, else fewest absent
+      // Returns an array of winners (could be multiple on tie)
+      const findBestMembers = (sessions) => {
+        const members = buildMemberStats(sessions).filter((m) => m.present > 0);
+        if (!members.length) return [];
+        const perfect = members.filter((m) => m.absent === 0);
+        if (perfect.length) {
+          const maxPresent = Math.max(...perfect.map((m) => m.present));
+          return perfect
+            .filter((m) => m.present === maxPresent)
+            .map((m) => ({ ...m, perfect: true }));
+        }
+        const minAbsent = Math.min(...members.map((m) => m.absent));
+        const nearPerfect = members.filter((m) => m.absent === minAbsent);
+        const maxPresent = Math.max(...nearPerfect.map((m) => m.present));
+        return nearPerfect
+          .filter((m) => m.present === maxPresent)
+          .map((m) => ({ ...m, perfect: false }));
+      };
+
+      // ── Group stats per activity type ──
+      const fGS = buildGroupStats(byType.fellowship);
+      const cGS = buildGroupStats(byType.cbs);
+      const eGS = buildGroupStats(byType.evangelism);
+      const allGroupNames = new Set([
+        ...Object.keys(fGS),
+        ...Object.keys(cGS),
+        ...Object.keys(eGS),
+      ]);
+      allGroupNames.delete("__unassigned__");
+
+      // Full group leaderboard with composite + per-type pcts
+      const groupLeaderboard = [];
+      allGroupNames.forEach((g) => {
+        const f = fGS[g] || { present: 0, total: 0 };
+        const c = cGS[g] || { present: 0, total: 0 };
+        const e = eGS[g] || { present: 0, total: 0 };
+        const fP = pct(f.present, f.total);
+        const cP = pct(c.present, c.total);
+        const eP = pct(e.present, e.total);
+        const activeSections =
+          (f.total > 0 ? 1 : 0) + (c.total > 0 ? 1 : 0) + (e.total > 0 ? 1 : 0);
+        if (!activeSections) return;
+        // Weighted composite: Fellowship 40%, CBS 35%, Evangelism 25%
+        const composite = parseFloat(
+          (fP * 0.4 + cP * 0.35 + eP * 0.25).toFixed(1),
+        );
+        groupLeaderboard.push({
+          name: g,
+          composite,
+          fellowship: { ...f, pct: fP },
+          cbs: { ...c, pct: cP },
+          evangelism: { ...e, pct: eP },
+        });
+      });
+      groupLeaderboard.sort((a, b) => b.composite - a.composite);
+
+      // ── 1. Best Group/s (overall composite) — supports ties ──
+      const bestGroups = (() => {
+        if (!groupLeaderboard.length) return [];
+        const topScore = groupLeaderboard[0].composite;
+        return groupLeaderboard.filter((g) => g.composite === topScore);
+      })();
+
+      // ── 1a. Best Group/s by Fellowship only ──
+      const fellowshipGroupBoard = [...groupLeaderboard]
+        .filter((g) => g.fellowship.total > 0)
+        .sort((a, b) => b.fellowship.pct - a.fellowship.pct);
+      const bestFellowshipGroups = (() => {
+        if (!fellowshipGroupBoard.length) return [];
+        const top = fellowshipGroupBoard[0].fellowship.pct;
+        return fellowshipGroupBoard.filter((g) => g.fellowship.pct === top);
+      })();
+
+      // ── 1b. Best Group/s by CBS only ──
+      const cbsGroupBoard = [...groupLeaderboard]
+        .filter((g) => g.cbs.total > 0)
+        .sort((a, b) => b.cbs.pct - a.cbs.pct);
+      const bestCBSGroups = (() => {
+        if (!cbsGroupBoard.length) return [];
+        const top = cbsGroupBoard[0].cbs.pct;
+        return cbsGroupBoard.filter((g) => g.cbs.pct === top);
+      })();
+
+      // ── 1c. Best Group/s by Evangelism only ──
+      const evangelismGroupBoard = [...groupLeaderboard]
+        .filter((g) => g.evangelism.total > 0)
+        .sort((a, b) => b.evangelism.pct - a.evangelism.pct);
+      const bestEvangelismGroups = (() => {
+        if (!evangelismGroupBoard.length) return [];
+        const top = evangelismGroupBoard[0].evangelism.pct;
+        return evangelismGroupBoard.filter((g) => g.evangelism.pct === top);
+      })();
+
+      // ── 2–4. Best individual member/s per activity (multi-winner, cross-group) ──
+      const bestFellowshipMembers = findBestMembers(byType.fellowship);
+      const bestCBSMembers = findBestMembers(byType.cbs);
+      const bestEvangelismMembers = findBestMembers(byType.evangelism);
+
+      // ── 5. Best Overall Member/s (no absences across all three combined) ──
+      const allSessions = [
+        ...byType.fellowship,
+        ...byType.cbs,
+        ...byType.evangelism,
+      ];
+      const bestOverallMembers = findBestMembers(allSessions);
+
+      // ── 6. Best Group Leader/s (own attendance + group performance) ──
+      const leaderQuery = { role: "Group Leader" };
+      if (targetBranch) leaderQuery.branch = targetBranch;
+      const leaders = await User.find(leaderQuery).lean();
+      const leaderLeaderboard = [];
+
+      for (const leader of leaders) {
+        const leaderMember = await Member.findOne({
+          phoneNumber: leader.phoneNumber,
+        }).lean();
+        let ownPresent = 0,
+          ownTotal = 0;
+        if (leaderMember) {
+          allSessions.forEach((s) => {
+            const r = (s.records || []).find(
+              (rec) => rec.memberId?.toString() === leaderMember._id.toString(),
+            );
+            if (r) {
+              ownTotal++;
+              if (r.status === "present") ownPresent++;
+            }
+          });
+        }
+        const g = leader.group;
+        let groupComposite = 0;
+        if (g) {
+          const gf = fGS[g] || { present: 0, total: 0 };
+          const gc = cGS[g] || { present: 0, total: 0 };
+          const ge = eGS[g] || { present: 0, total: 0 };
+          groupComposite = parseFloat(
+            (
+              pct(gf.present, gf.total) * 0.4 +
+              pct(gc.present, gc.total) * 0.35 +
+              pct(ge.present, ge.total) * 0.25
+            ).toFixed(1),
+          );
+        }
+        const ownPct = pct(ownPresent, ownTotal);
+        const composite = parseFloat(
+          (ownTotal > 0
+            ? ownPct * 0.4 + groupComposite * 0.6
+            : groupComposite * 0.6
+          ).toFixed(1),
+        );
+        leaderLeaderboard.push({
+          name: leader.fullName,
+          group: g,
+          ownPct,
+          ownPresent,
+          ownTotal,
+          groupPct: groupComposite,
+          composite,
+        });
+      }
+      leaderLeaderboard.sort((a, b) => b.composite - a.composite);
+
+      // Multi-winner leaders
+      const bestLeaders = (() => {
+        if (!leaderLeaderboard.length) return [];
+        const topScore = leaderLeaderboard[0].composite;
+        return leaderLeaderboard.filter((l) => l.composite === topScore);
+      })();
+
+      // ── 7. Best CBS Location/s ──
+      const cbsLocMap = {};
+      byType.cbs.forEach((s) => {
+        const loc = s.cbsLocation || "__none__";
+        if (loc === "__none__") return;
+        if (!cbsLocMap[loc])
+          cbsLocMap[loc] = { present: 0, total: 0, sessions: 0 };
+        cbsLocMap[loc].sessions++;
+        (s.records || []).forEach((r) => {
+          cbsLocMap[loc].total++;
+          if (r.status === "present") cbsLocMap[loc].present++;
+        });
+      });
+      const cbsLocLeaderboard = Object.entries(cbsLocMap)
+        .map(([name, s]) => ({ name, ...s, pct: pct(s.present, s.total) }))
+        .sort((a, b) => b.pct - a.pct);
+
+      const bestCBSLocations = (() => {
+        if (!cbsLocLeaderboard.length) return [];
+        const topPct = cbsLocLeaderboard[0].pct;
+        return cbsLocLeaderboard.filter((l) => l.pct === topPct);
+      })();
 
       res.json({
-        success: true,
-        totalRows: rows.length,
-        savedCount,
-        skippedCount,
-        errorCount,
-        skippedDetails,
-        savedMembers,
+        branch: targetBranch || "All Branches",
+        quarter: quarter || "all",
+        quarterLabel,
+        generatedAt: new Date().toISOString(),
+        stats: {
+          totalFellowshipSessions: byType.fellowship.length,
+          totalCBSSessions: byType.cbs.length,
+          totalEvangelismSessions: byType.evangelism.length,
+          totalSessions: allAtt.length,
+        },
+        // Group awards
+        bestGroups, // overall composite
+        bestFellowshipGroups, // fellowship only
+        bestCBSGroups, // cbs only
+        bestEvangelismGroups, // evangelism only
+        groupLeaderboard: groupLeaderboard.slice(0, 10),
+        fellowshipGroupBoard: fellowshipGroupBoard.slice(0, 10),
+        cbsGroupBoard: cbsGroupBoard.slice(0, 10),
+        evangelismGroupBoard: evangelismGroupBoard.slice(0, 10),
+        // Member awards (arrays — ties supported, cross-group)
+        bestFellowshipMembers,
+        bestCBSMembers,
+        bestEvangelismMembers,
+        bestOverallMembers,
+        // Leader awards (arrays — ties supported)
+        bestLeaders,
+        leaderLeaderboard: leaderLeaderboard.slice(0, 10),
+        // CBS Location awards (arrays — ties supported)
+        bestCBSLocations,
+        cbsLocLeaderboard: cbsLocLeaderboard.slice(0, 10),
       });
-    } catch (error) {
-      console.error("Bulk upload error:", error);
-      res
-        .status(500)
-        .json({ error: error.message || "Server error during bulk upload" });
-    }
-  },
-);
-
-/**
- * GET /api/members/bulk-upload/history
- * Returns the last 20 Excel upload logs.
- * Group Leaders see only their own uploads; higher roles see all.
- */
-app.get(
-  "/api/members/bulk-upload/history",
-  authMiddleware,
-  roleMiddleware(
-    "Head Shepherd",
-    "Branch Head Shepherd",
-    "Group Leader",
-    "System Admin",
-  ),
-  async (req, res) => {
-    try {
-      const filter =
-        req.user.role === "Group Leader" ? { uploadedBy: req.user._id } : {};
-      const uploads = await ExcelUpload.find(filter)
-        .sort({ createdAt: -1 })
-        .limit(20)
-        .lean();
-      res.json(uploads);
-    } catch (e) {
-      res.status(500).json({ error: "Server error" });
+    } catch (err) {
+      console.error("Comprehensive report error:", err);
+      res.status(500).json({ error: err.message || "Server error" });
     }
   },
 );
