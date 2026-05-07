@@ -1381,6 +1381,20 @@ app.post(
 );
 
 // ========== ATTENDANCE ROUTES ==========
+
+// GET /api/attendance-years — returns distinct years that have attendance records
+app.get("/api/attendance-years", authMiddleware, async (req, res) => {
+  try {
+    const records = await Attendance.find({}, { date: 1 }).lean();
+    const years = [
+      ...new Set(records.map((r) => new Date(r.date).getFullYear())),
+    ].sort((a, b) => b - a); // newest first
+    res.json(years);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 app.get("/api/attendance", authMiddleware, async (req, res) => {
   try {
     const { type, group, cbsLocation, date, branch } = req.query;
@@ -3252,7 +3266,7 @@ app.get("/api/followup-chat/unread/count", authMiddleware, async (req, res) => {
 
 // ═══════════════════════════════════════════════════════════════
 // COMPREHENSIVE REPORT ENDPOINT
-// GET /api/comprehensive-report?branch=...&quarter=Q1|Q2|Q3|Q4|all
+// GET /api/comprehensive-report?branch=...&quarter=Q1|Q2|Q3|Q4|all&year=2024
 // ═══════════════════════════════════════════════════════════════
 app.get(
   "/api/comprehensive-report",
@@ -3261,7 +3275,8 @@ app.get(
   async (req, res) => {
     try {
       const { branch, quarter } = req.query;
-      const year = new Date().getFullYear();
+      // Support year param so past years can be reviewed; default to current year
+      const year = parseInt(req.query.year, 10) || new Date().getFullYear();
 
       // ── Quarter date range ──
       const qDefs = {
@@ -3285,15 +3300,28 @@ app.get(
           end: new Date(year + 1, 0, 0, 23, 59, 59, 999),
           label: `Q4 ${year} (Oct – Dec)`,
         },
+        all: {
+          start: new Date(year, 0, 1),
+          end: new Date(year, 11, 31, 23, 59, 59, 999),
+          label: `All Quarters ${year}`,
+        },
       };
       let dateFilter = {};
-      let quarterLabel = "All Time";
-      if (quarter && qDefs[quarter]) {
+      let quarterLabel = `All Quarters ${year}`;
+      // When a specific year is selected, always scope to that year
+      if (quarter && quarter !== "all" && qDefs[quarter]) {
         dateFilter.date = {
           $gte: qDefs[quarter].start,
           $lte: qDefs[quarter].end,
         };
         quarterLabel = qDefs[quarter].label;
+      } else {
+        // Scope to the selected year for both all-quarters and year-only views
+        dateFilter.date = {
+          $gte: qDefs.all.start,
+          $lte: qDefs.all.end,
+        };
+        quarterLabel = qDefs.all.label;
       }
 
       // ── Branch scope ──
