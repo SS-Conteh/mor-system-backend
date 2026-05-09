@@ -47,7 +47,6 @@ const MEMBERSHIP_STATUSES = [
   "Semi-Consistent",
   "Consistent",
   "Intense Leader",
-  "Discipleship",
   "Leader",
 ];
 
@@ -188,7 +187,6 @@ const GroupSchema = new mongoose.Schema({
   semiConsistentCount: { type: Number, default: 0 },
   inconsistentCount: { type: Number, default: 0 },
   firstTimerCount: { type: Number, default: 0 },
-  discipleshipCount: { type: Number, default: 0 },
   description: String,
   isActive: { type: Boolean, default: true },
   createdAt: { type: Date, default: Date.now },
@@ -1149,7 +1147,6 @@ app.post(
         inconsistent: "Inconsistent",
         "first timer": "First Timer",
         "first timers": "First Timer",
-        discipleship: "Discipleship",
       };
 
       const VALID_STATUSES = [
@@ -1158,7 +1155,6 @@ app.post(
         "Semi-Consistent",
         "Consistent",
         "Intense Leader",
-        "Discipleship",
         "Leader",
       ];
 
@@ -1233,8 +1229,7 @@ app.post(
           nameVal === "Consistent" ||
           nameVal === "Semi-Consistent" ||
           nameVal === "Inconsistent" ||
-          nameVal === "First Timer" ||
-          nameVal === "Discipleship"
+          nameVal === "First Timer"
         ) {
           // header/label row — skip
           continue;
