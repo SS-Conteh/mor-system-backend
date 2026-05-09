@@ -1080,18 +1080,77 @@ app.post(
       const workbook = XLSX.read(req.file.buffer, { type: "buffer" });
       const sheetName = workbook.SheetNames[0];
       const sheet = workbook.Sheets[sheetName];
-      const rows = XLSX.utils.sheet_to_json(sheet, { defval: "" });
 
-      if (!rows.length)
-        return res
-          .status(400)
-          .json({ error: "Excel file is empty or has no data rows" });
+      // ── Smart parser: handles any column naming + section-label statuses ──
+      const normHdr = (s) =>
+        String(s || "")
+          .trim()
+          .toLowerCase()
+          .replace(/[\s_-]+/g, " ");
 
-      const DEFAULT_PASSWORD = "member123";
-      const hashedPassword = await bcrypt.hash(DEFAULT_PASSWORD, 10);
+      // All accepted aliases for each field
+      const FIELD_ALIASES = {
+        fullName: [
+          "full name",
+          "fullname",
+          "name",
+          "member",
+          "members",
+          "member name",
+          "participant",
+          "participants",
+        ],
+        phone: [
+          "phone",
+          "phone number",
+          "phonenumber",
+          "mobile",
+          "mobile number",
+          "contact",
+          "contacts",
+          "contact number",
+          "tel",
+          "telephone",
+          "phone no",
+          "phone#",
+          "cell",
+        ],
+        membershipStatus: [
+          "membership status",
+          "status",
+          "membership status",
+          "memberstatus",
+          "member status",
+          "level",
+          "category",
+        ],
+        group: ["group", "group name", "groupname", "cell", "cell group"],
+        gender: ["gender", "sex"],
+        cbsLocation: [
+          "cbs location",
+          "cbslocation",
+          "cbs",
+          "cbs location",
+          "location",
+          "cbs loc",
+        ],
+      };
 
-      const leaderGroup = req.user.group;
-      const leaderBranch = req.user.branch || "MOR Head Quarter";
+      // Map Excel section/category labels → system membership status values
+      const STATUS_SECTION_MAP = {
+        leaders: "Leader",
+        leader: "Leader",
+        intense: "Intense Leader",
+        "intense leader": "Intense Leader",
+        consistent: "Consistent",
+        "semi-consistent": "Semi-Consistent",
+        "semi consistent": "Semi-Consistent",
+        semiconsistent: "Semi-Consistent",
+        inconsistent: "Inconsistent",
+        "first timer": "First Timer",
+        "first timers": "First Timer",
+        discipleship: "Discipleship",
+      };
 
       const VALID_STATUSES = [
         "First Timer",
@@ -1103,68 +1162,176 @@ app.post(
         "Leader",
       ];
 
-      // Normalise a header string: trim, lowercase, strip spaces/underscores
-      const norm = (s) =>
-        String(s || "")
-          .trim()
-          .toLowerCase()
-          .replace(/[\s_-]+/g, "");
+      // Use sheet_to_json with array-of-arrays to support section-label rows
+      const rawAoA = XLSX.utils.sheet_to_json(sheet, {
+        header: 1,
+        defval: null,
+        raw: false,
+      });
 
-      // Map columns by normalised header name
-      const colMap = {};
-      if (rows.length) {
-        Object.keys(rows[0]).forEach((k) => {
-          colMap[norm(k)] = k;
+      // Find header row (first row with a recognised field alias)
+      const allAliases = Object.values(FIELD_ALIASES).flat();
+      let headerRowIdx = -1;
+      for (let i = 0; i < Math.min(rawAoA.length, 15); i++) {
+        const rowNorm = (rawAoA[i] || []).map((c) => normHdr(String(c || "")));
+        if (rowNorm.some((v) => allAliases.includes(v))) {
+          headerRowIdx = i;
+          break;
+        }
+      }
+
+      // Build column index → field mapping from header row
+      const colIdxMap = {};
+      if (headerRowIdx >= 0) {
+        (rawAoA[headerRowIdx] || []).forEach((cell, ci) => {
+          const norm = normHdr(String(cell || ""));
+          for (const [field, aliases] of Object.entries(FIELD_ALIASES)) {
+            if (
+              aliases.includes(norm) &&
+              !Object.values(colIdxMap).includes(field)
+            ) {
+              colIdxMap[ci] = field;
+            }
+          }
         });
       }
 
-      const getCol = (row, ...aliases) => {
-        for (const a of aliases) {
-          const raw = colMap[norm(a)];
-          if (
-            raw !== undefined &&
-            row[raw] !== undefined &&
-            String(row[raw]).trim() !== ""
-          ) {
-            return String(row[raw]).trim();
+      // Walk data rows, tracking running status from section-label rows
+      const parsedRows = [];
+      let currentSectionStatus = "";
+
+      const startRow = headerRowIdx >= 0 ? headerRowIdx + 1 : 0;
+      for (let ri = startRow; ri < rawAoA.length; ri++) {
+        const row = rawAoA[ri] || [];
+        const rec = {};
+        for (const [ci, field] of Object.entries(colIdxMap)) {
+          const val = row[ci];
+          if (val !== null && val !== undefined && String(val).trim()) {
+            rec[field] = String(val).trim();
           }
         }
-        return "";
-      };
+
+        const nameVal = rec.fullName || "";
+        // Skip formula/empty rows
+        if (!nameVal || nameVal.startsWith("=")) continue;
+
+        // Detect category label rows (name is a status keyword, no other data)
+        const normName = normHdr(nameVal);
+        const isSectionLabel = STATUS_SECTION_MAP[normName] !== undefined;
+        const hasOtherData = Object.keys(rec).some(
+          (k) => k !== "fullName" && rec[k],
+        );
+
+        if (isSectionLabel && !hasOtherData) {
+          currentSectionStatus = STATUS_SECTION_MAP[normName];
+          continue;
+        }
+        if (
+          nameVal === "Members" ||
+          nameVal === "Leaders" ||
+          nameVal === "Intense" ||
+          nameVal === "Consistent" ||
+          nameVal === "Semi-Consistent" ||
+          nameVal === "Inconsistent" ||
+          nameVal === "First Timer" ||
+          nameVal === "Discipleship"
+        ) {
+          // header/label row — skip
+          continue;
+        }
+
+        // Resolve membership status
+        let resolvedStatus = "";
+        if (rec.membershipStatus) {
+          const mapped = STATUS_SECTION_MAP[normHdr(rec.membershipStatus)];
+          resolvedStatus =
+            mapped ||
+            (VALID_STATUSES.includes(rec.membershipStatus)
+              ? rec.membershipStatus
+              : "");
+        }
+        if (!resolvedStatus)
+          resolvedStatus = currentSectionStatus || "First Timer";
+
+        parsedRows.push({
+          fullName: nameVal,
+          phone: rec.phone || "",
+          membershipStatus: resolvedStatus,
+          group: rec.group || "",
+          gender: rec.gender || "",
+          cbsLocation: rec.cbsLocation || "",
+        });
+      }
+
+      // Fallback: if smart parser got nothing, try original sheet_to_json
+      if (!parsedRows.length) {
+        const fallbackRows = XLSX.utils.sheet_to_json(sheet, { defval: "" });
+        fallbackRows.forEach((r) => {
+          const keys = Object.keys(r);
+          const get = (...aliases) => {
+            for (const a of aliases) {
+              const k = keys.find((k) => normHdr(k) === normHdr(a));
+              if (k && String(r[k]).trim()) return String(r[k]).trim();
+            }
+            return "";
+          };
+          const fn = get("full name", "fullname", "name", "member", "members");
+          if (fn)
+            parsedRows.push({
+              fullName: fn,
+              phone: get(
+                "phone",
+                "phone number",
+                "contact",
+                "contacts",
+                "mobile",
+                "tel",
+              ),
+              membershipStatus:
+                get("membership status", "status", "level") || "First Timer",
+              group: get("group", "group name") || "",
+              gender: get("gender", "sex") || "",
+              cbsLocation: get("cbs location", "cbslocation", "cbs") || "",
+            });
+        });
+      }
+
+      if (!parsedRows.length)
+        return res
+          .status(400)
+          .json({ error: "Excel file is empty or has no data rows" });
+
+      const DEFAULT_PASSWORD = "member123";
+      const hashedPassword = await bcrypt.hash(DEFAULT_PASSWORD, 10);
+
+      const leaderGroup = req.user.group;
+      const leaderBranch = req.user.branch || "MOR Head Quarter";
 
       let successCount = 0;
       const skippedDetails = [];
 
-      for (const row of rows) {
-        const fullName = getCol(
-          row,
-          "Full Name",
-          "FullName",
-          "Name",
-          "full name",
-        );
-        const phone = getCol(
-          row,
-          "Phone",
-          "Phone Number",
-          "PhoneNumber",
-          "phone",
-        );
-        const rawStatus = getCol(
-          row,
-          "Membership Status",
-          "MembershipStatus",
-          "Status",
-        );
-        const group = getCol(row, "Group") || leaderGroup;
-        const gender = getCol(row, "Gender");
-        const cbsLocation = getCol(row, "CBS Location", "CBSLocation", "cbs");
+      for (const row of parsedRows) {
+        const fullName = row.fullName;
+        const phone = row.phone;
+        const rawStatus = row.membershipStatus;
+        const group = row.group || leaderGroup;
+        const gender = row.gender;
+        const cbsLocation = row.cbsLocation;
 
-        if (!fullName || !phone) {
+        if (!fullName) {
           skippedDetails.push({
             phone: phone || "—",
-            name: fullName || "—",
-            reason: "Missing Full Name or Phone",
+            name: "—",
+            reason: "Missing Full Name",
+          });
+          continue;
+        }
+        // Phone missing — still import but note it
+        if (!phone) {
+          skippedDetails.push({
+            phone: "—",
+            name: fullName,
+            reason: "Missing Phone — skipped",
           });
           continue;
         }
