@@ -1403,7 +1403,7 @@ app.post(
         group: leaderGroup || "N/A",
         branch: leaderBranch,
         fileName: req.file.originalname,
-        totalRows: rows.length,
+        totalRows: parsedRows.length, // fixed: was `rows` (undefined)
         successCount,
         skippedCount: skippedDetails.length,
         skippedDetails,
@@ -1416,9 +1416,12 @@ app.post(
 
       res.json({
         message: `Import complete. ${successCount} member(s) added, ${skippedDetails.length} skipped.`,
-        successCount,
+        successCount, // primary field
+        savedCount: successCount, // alias for older clients
         skippedCount: skippedDetails.length,
-        skipped: skippedDetails,
+        errorCount: 0, // no hard errors if we reached here
+        skippedDetails, // array with name/phone/reason
+        skipped: skippedDetails, // alias for older clients
       });
     } catch (error) {
       console.error("Excel import error:", error);
@@ -1426,6 +1429,33 @@ app.post(
         .status(500)
         .json({ error: error.message || "Server error during import" });
     }
+  },
+);
+
+// ── ALIAS: /api/members/bulk-upload → same handler as /api/members/import-excel ──
+// Kept for backwards compatibility; the canonical URL is /api/members/import-excel
+app.post(
+  "/api/members/bulk-upload",
+  authMiddleware,
+  roleMiddleware(
+    "Head Shepherd",
+    "Branch Head Shepherd",
+    "Group Leader",
+    "System Admin",
+  ),
+  excelUpload.single("excelFile"),
+  async (req, res) => {
+    // Forward internally by forwarding the request body to the import-excel logic.
+    // We simply re-use the same route so both URLs work identically.
+    req.url = "/api/members/import-excel";
+    return app._router.handle(
+      Object.assign(req, {
+        url: "/api/members/import-excel",
+        path: "/api/members/import-excel",
+      }),
+      res,
+      () => res.status(404).json({ error: "Not found" }),
+    );
   },
 );
 
