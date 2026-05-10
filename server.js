@@ -1274,14 +1274,11 @@ app.post(
           if (fn)
             parsedRows.push({
               fullName: fn,
-              phone: get(
-                "phone",
-                "phone number",
-                "contact",
-                "contacts",
-                "mobile",
-                "tel",
-              ),
+              phone: (() => {
+                const raw = get("phone", "phone number", "contact", "contacts", "mobile", "tel");
+                const p = raw.replace(/\s+/g, "");
+                return (/^\d+$/.test(p) && p.length > 0 && p[0] !== "0") ? "0" + p : p;
+              })(),
               membershipStatus:
                 get("membership status", "status", "level") || "First Timer",
               group: get("group", "group name") || "",
@@ -1331,8 +1328,12 @@ app.post(
           continue;
         }
 
-        // Clean phone: digits only for uniqueness check
-        const cleanPhone = phone.replace(/\s+/g, "");
+        // Clean phone: strip spaces, then restore leading zero Excel may have stripped.
+        // e.g. "33230039" (8 digits, no leading 0) → "033230039"
+        let cleanPhone = phone.replace(/\s+/g, "");
+        if (/^\d+$/.test(cleanPhone) && cleanPhone.length > 0 && cleanPhone[0] !== "0") {
+          cleanPhone = "0" + cleanPhone;
+        }
 
         // Skip if phone already registered in User or Member
         const existingUser = await User.findOne({ phoneNumber: cleanPhone });
