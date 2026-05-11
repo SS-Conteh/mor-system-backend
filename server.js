@@ -1275,9 +1275,18 @@ app.post(
             parsedRows.push({
               fullName: fn,
               phone: (() => {
-                const raw = get("phone", "phone number", "contact", "contacts", "mobile", "tel");
+                const raw = get(
+                  "phone",
+                  "phone number",
+                  "contact",
+                  "contacts",
+                  "mobile",
+                  "tel",
+                );
                 const p = raw.replace(/\s+/g, "");
-                return (/^\d+$/.test(p) && p.length > 0 && p[0] !== "0") ? "0" + p : p;
+                return /^\d+$/.test(p) && p.length > 0 && p[0] !== "0"
+                  ? "0" + p
+                  : p;
               })(),
               membershipStatus:
                 get("membership status", "status", "level") || "First Timer",
@@ -1331,7 +1340,11 @@ app.post(
         // Clean phone: strip spaces, then restore leading zero Excel may have stripped.
         // e.g. "33230039" (8 digits, no leading 0) → "033230039"
         let cleanPhone = phone.replace(/\s+/g, "");
-        if (/^\d+$/.test(cleanPhone) && cleanPhone.length > 0 && cleanPhone[0] !== "0") {
+        if (
+          /^\d+$/.test(cleanPhone) &&
+          cleanPhone.length > 0 &&
+          cleanPhone[0] !== "0"
+        ) {
           cleanPhone = "0" + cleanPhone;
         }
 
@@ -3220,14 +3233,7 @@ async function initializeDatabase() {
         console.log(`   ✓ Created branch: ${branchName}`);
       }
     }
-    const groups = [
-      "General",
-      "Success",
-      "Empowerment",
-      "Zoe",
-      "Favour",
-      "Dominion",
-    ];
+    const groups = ["Success", "Empowerment", "Zoe", "Favour", "Dominion"];
     for (const groupName of groups) {
       if (!(await Group.findOne({ name: groupName }))) {
         await Group.create({
