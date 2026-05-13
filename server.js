@@ -3157,7 +3157,7 @@ const STATUS_ORDER = [
   "Intense Leader", // 4
   "Leader", // 5
 ];
-const SESSIONS_PER_QUARTER = 13; // Ministry counts 13 weeks per quarter
+const SESSIONS_PER_QUARTER = 12; // Ministry counts 12 of 13 weeks per quarter
 
 function getQuarterLabel(date) {
   const m = date.getMonth();
