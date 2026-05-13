@@ -3157,7 +3157,7 @@ const STATUS_ORDER = [
   "Intense Leader", // 4
   "Leader", // 5
 ];
-const SESSIONS_PER_QUARTER = 12; // Ministry counts 12 of 13 weeks per quarter
+const SESSIONS_PER_QUARTER = 13; // Full 13 Saturdays per quarter (no deductions)
 
 function getQuarterLabel(date) {
   const m = date.getMonth();
@@ -3263,7 +3263,10 @@ async function runQuarterlyStatusUpdate(quarterDate) {
           ),
         ).length;
 
-        const pct = parseFloat(((attended / totalSessions) * 100).toFixed(1));
+        const pct = Math.min(
+          100,
+          parseFloat(((attended / totalSessions) * 100).toFixed(1)),
+        );
 
         // Check UP first, then DOWN
         const upResult = evalStatusUp(member.membershipStatus, pct);
