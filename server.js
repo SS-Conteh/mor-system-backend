@@ -448,6 +448,42 @@ const BulkImportSchema = new mongoose.Schema({
 });
 const BulkImport = mongoose.model("BulkImport", BulkImportSchema);
 
+// ========== STATUS UPDATE MODEL ==========
+// Tracks every automatic or pending status change
+const StatusUpdateSchema = new mongoose.Schema({
+  memberId: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: "Member",
+    required: true,
+  },
+  memberName: { type: String, required: true },
+  memberPhone: String,
+  group: String,
+  branch: { type: String, default: "MOR Head Quarter" },
+  fromStatus: { type: String, required: true },
+  toStatus: { type: String, required: true },
+  direction: { type: String, enum: ["up", "down"], required: true },
+  attendancePct: { type: Number, required: true }, // e.g. 66.7
+  attended: { type: Number, required: true },
+  totalSessions: { type: Number, required: true }, // always 12 (max per quarter)
+  quarter: { type: String, required: true }, // "Q1 2025"
+  // "auto"    = applied immediately (no approval needed)
+  // "pending" = needs group leader approval (Consistent→Intense, Intense→Leader,
+  //             Leader→Intense, Intense→Consistent)
+  status: {
+    type: String,
+    enum: ["auto", "pending", "approved", "rejected"],
+    default: "auto",
+  },
+  reviewedBy: { type: mongoose.Schema.Types.ObjectId, ref: "User" },
+  reviewedByName: String,
+  reviewedAt: Date,
+  rejectionNote: String,
+  appliedAt: Date,
+  createdAt: { type: Date, default: Date.now },
+});
+const StatusUpdate = mongoose.model("StatusUpdate", StatusUpdateSchema);
+
 // ========== AUTH MIDDLEWARE ==========
 const authMiddleware = async (req, res, next) => {
   try {
@@ -3099,6 +3135,416 @@ app.get("/api/debug/user", authMiddleware, async (req, res) => {
 });
 
 // ========== AUTOMATED CRON JOBS ==========
+
+// ── Quarterly Membership Status Auto-Update Engine ────────────────────────
+// Rules (based on 12 counted fellowship Saturdays per quarter):
+//   UP:   First Timer → Inconsistent     : >= 60%  (auto)
+//         Inconsistent → Semi-Consistent : >= 60%  (auto)
+//         Semi-Consistent → Consistent   : >= 70%  (auto)
+//         Consistent → Intense Leader    : >= 90%  (PENDING — GL approval)
+//         Intense Leader → Leader        : = 100%  (PENDING — GL approval)
+//   DOWN: Semi-Consistent → Inconsistent : <= 40%  (auto)
+//         Consistent → Inconsistent      : <= 40%  (auto)  [skips Semi]
+//         Intense Leader → Consistent    : <= 40%  (PENDING — GL approval)
+//         Leader → Intense Leader        : <= 40%  (PENDING — GL approval)
+//   NOTE: First Timer is excluded from DOWN rules.
+//         "Discipleship" status is excluded from both — handled manually.
+const STATUS_ORDER = [
+  "First Timer", // 0
+  "Inconsistent", // 1
+  "Semi-Consistent", // 2
+  "Consistent", // 3
+  "Intense Leader", // 4
+  "Leader", // 5
+];
+const SESSIONS_PER_QUARTER = 12; // Ministry counts 12 of 13 weeks per quarter
+
+function getQuarterLabel(date) {
+  const m = date.getMonth();
+  const q = Math.floor(m / 3) + 1;
+  return `Q${q} ${date.getFullYear()}`;
+}
+
+function getQuarterDateRange(date) {
+  const year = date.getFullYear();
+  const q = Math.floor(date.getMonth() / 3);
+  const starts = [
+    new Date(year, 0, 1),
+    new Date(year, 3, 1),
+    new Date(year, 6, 1),
+    new Date(year, 9, 1),
+  ];
+  const ends = [
+    new Date(year, 2, 31, 23, 59, 59),
+    new Date(year, 5, 30, 23, 59, 59),
+    new Date(year, 8, 30, 23, 59, 59),
+    new Date(year, 11, 31, 23, 59, 59),
+  ];
+  return { start: starts[q], end: ends[q] };
+}
+
+// Check if member needs UP promotion
+function evalStatusUp(status, pct) {
+  // Returns { toStatus, pending } or null
+  if (status === "First Timer" && pct >= 60)
+    return { toStatus: "Inconsistent", pending: false };
+  if (status === "Inconsistent" && pct >= 60)
+    return { toStatus: "Semi-Consistent", pending: false };
+  if (status === "Semi-Consistent" && pct >= 70)
+    return { toStatus: "Consistent", pending: false };
+  if (status === "Consistent" && pct >= 90)
+    return { toStatus: "Intense Leader", pending: true };
+  if (status === "Intense Leader" && pct >= 100)
+    return { toStatus: "Leader", pending: true };
+  return null;
+}
+
+// Check if member needs DOWN demotion
+function evalStatusDown(status, pct) {
+  // First Timer excluded. Discipleship excluded.
+  if (status === "First Timer" || status === "Discipleship") return null;
+  if (status === "Semi-Consistent" && pct <= 40)
+    return { toStatus: "Inconsistent", pending: false };
+  if (status === "Consistent" && pct <= 40)
+    return { toStatus: "Inconsistent", pending: false };
+  if (status === "Intense Leader" && pct <= 40)
+    return { toStatus: "Consistent", pending: true };
+  if (status === "Leader" && pct <= 40)
+    return { toStatus: "Intense Leader", pending: true };
+  return null;
+}
+
+async function runQuarterlyStatusUpdate(quarterDate) {
+  const quarterLabel = getQuarterLabel(quarterDate);
+  const { start, end } = getQuarterDateRange(quarterDate);
+  console.log(
+    `⚙️  Running quarterly status update for ${quarterLabel} (${start.toDateString()} – ${end.toDateString()})`,
+  );
+
+  try {
+    const groups = await Group.find();
+    let totalProcessed = 0,
+      totalUpdated = 0,
+      totalPending = 0;
+
+    for (const group of groups) {
+      const members = await Member.find({
+        group: group.name,
+        membershipStatus: { $in: STATUS_ORDER },
+      });
+      if (!members.length) continue;
+
+      // Fetch all fellowship Saturday sessions in this quarter for this group
+      const sessions = await Attendance.find({
+        type: "fellowship",
+        group: group.name,
+        date: { $gte: start, $lte: end },
+      });
+
+      // Cap at SESSIONS_PER_QUARTER (12) — use actual count but max 12
+      const totalSessions = Math.min(sessions.length, SESSIONS_PER_QUARTER);
+      if (totalSessions === 0) continue;
+
+      // Find group leader user for pending notifications
+      const groupLeaderUser = await User.findOne({
+        group: group.name,
+        role: "Group Leader",
+      });
+      // Find head shepherd(s)
+      const headShepherds = await User.find({
+        role: { $in: ["Head Shepherd", "Branch Head Shepherd"] },
+      });
+
+      for (const member of members) {
+        totalProcessed++;
+        const attended = sessions.filter((s) =>
+          s.records.some(
+            (r) => r.memberName === member.fullName && r.status === "present",
+          ),
+        ).length;
+
+        const pct = parseFloat(((attended / totalSessions) * 100).toFixed(1));
+
+        // Check UP first, then DOWN
+        const upResult = evalStatusUp(member.membershipStatus, pct);
+        const downResult = upResult
+          ? null
+          : evalStatusDown(member.membershipStatus, pct);
+        const result = upResult || downResult;
+        if (!result) continue;
+
+        const direction = upResult ? "up" : "down";
+
+        // Avoid duplicate entries for same member + quarter
+        const existing = await StatusUpdate.findOne({
+          memberId: member._id,
+          quarter: quarterLabel,
+          toStatus: result.toStatus,
+        });
+        if (existing) continue;
+
+        // Create the status update record
+        const updateStatus = result.pending ? "pending" : "auto";
+        const record = await StatusUpdate.create({
+          memberId: member._id,
+          memberName: member.fullName,
+          memberPhone: member.phoneNumber,
+          group: group.name,
+          branch: member.branch || group.branch || "MOR Head Quarter",
+          fromStatus: member.membershipStatus,
+          toStatus: result.toStatus,
+          direction,
+          attendancePct: pct,
+          attended,
+          totalSessions,
+          quarter: quarterLabel,
+          status: updateStatus,
+          appliedAt: updateStatus === "auto" ? new Date() : undefined,
+        });
+
+        // Apply immediately for auto updates
+        if (updateStatus === "auto") {
+          await Member.findByIdAndUpdate(member._id, {
+            membershipStatus: result.toStatus,
+          });
+          await User.findOneAndUpdate(
+            { phoneNumber: member.phoneNumber },
+            { membershipStatus: result.toStatus },
+          );
+          totalUpdated++;
+        } else {
+          totalPending++;
+        }
+
+        // ── Notification messages ────────────────────────────────────────
+        const dirEmoji = direction === "up" ? "📈" : "📉";
+        const dirWord = direction === "up" ? "promoted" : "demoted";
+        const pendNote = result.pending ? " (Pending GL approval)" : "";
+        const pctStr = `${attended}/${totalSessions} (${pct}%)`;
+
+        const memberTitle = `${dirEmoji} Your Status Update${pendNote}`;
+        const memberMsg = result.pending
+          ? `Your fellowship attendance for ${quarterLabel} was ${pctStr}. A status change from "${member.membershipStatus}" to "${result.toStatus}" has been submitted and is pending your Group Leader's approval.`
+          : `Based on your fellowship attendance for ${quarterLabel} (${pctStr}), your membership status has been updated from "${member.membershipStatus}" to "${result.toStatus}".`;
+
+        const leaderTitle = `${dirEmoji} Status Update — ${member.fullName}${pendNote}`;
+        const leaderMsg = result.pending
+          ? `${member.fullName} (${group.name} Group) has a pending status change from "${member.membershipStatus}" to "${result.toStatus}" for ${quarterLabel} (attendance: ${pctStr}). Please review and approve or reject in the Status Updates section.`
+          : `${member.fullName} in ${group.name} Group has been ${dirWord} from "${member.membershipStatus}" to "${result.toStatus}" for ${quarterLabel} (attendance: ${pctStr}).`;
+
+        // Notify the member (by phone/user account)
+        const memberUser = await User.findOne({
+          phoneNumber: member.phoneNumber,
+        });
+        if (memberUser) {
+          await sendSystemNotification(
+            memberTitle,
+            memberMsg,
+            "personal",
+            null,
+            memberUser._id,
+          );
+        }
+
+        // Notify the group leader
+        if (groupLeaderUser) {
+          await sendSystemNotification(
+            leaderTitle,
+            leaderMsg,
+            "group",
+            group.name,
+            groupLeaderUser._id,
+          );
+        }
+
+        // Notify head shepherds
+        for (const hs of headShepherds) {
+          await sendSystemNotification(
+            leaderTitle,
+            leaderMsg,
+            "report",
+            null,
+            hs._id,
+          );
+        }
+
+        await logActivity(
+          `STATUS_${direction.toUpperCase()}${result.pending ? "_PENDING" : "_AUTO"}`,
+          null,
+          `${member.fullName} (${group.name}): ${member.membershipStatus} → ${result.toStatus} | ${pctStr} | ${quarterLabel}${result.pending ? " [PENDING]" : ""}`,
+        );
+      }
+    }
+
+    console.log(
+      `✅ Quarterly status update complete: ${totalProcessed} checked, ${totalUpdated} auto-updated, ${totalPending} pending approval`,
+    );
+    return { totalProcessed, totalUpdated, totalPending };
+  } catch (e) {
+    console.error("❌ Quarterly status update error:", e.message);
+    throw e;
+  }
+}
+
+// Run on the 1st day of Jan, Apr, Jul, Oct at 08:00 server time (start of next quarter)
+cron.schedule("0 8 1 1,4,7,10 *", async () => {
+  const prevQtrDate = new Date();
+  prevQtrDate.setMonth(prevQtrDate.getMonth() - 1); // roll back to the quarter just ended
+  await runQuarterlyStatusUpdate(prevQtrDate);
+});
+
+// ── Status Update API endpoints ──────────────────────────────────────────────
+
+// GET /api/status-updates — list for the requesting GL's group (or all for HS)
+app.get("/api/status-updates", authMiddleware, async (req, res) => {
+  try {
+    const { quarter, status, group } = req.query;
+    const query = {};
+    if (req.user.role === "Group Leader") {
+      query.group = req.user.group;
+    } else if (req.user.role === "Branch Head Shepherd") {
+      query.branch = req.user.branch;
+    }
+    if (quarter) query.quarter = quarter;
+    if (status) query.status = status;
+    if (
+      group &&
+      ["Head Shepherd", "Branch Head Shepherd", "System Admin"].includes(
+        req.user.role,
+      )
+    ) {
+      query.group = group;
+    }
+    const updates = await StatusUpdate.find(query)
+      .sort({ createdAt: -1 })
+      .limit(300);
+    res.json(updates);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// POST /api/status-updates/run — manual trigger (HS/Admin only)
+app.post(
+  "/api/status-updates/run",
+  authMiddleware,
+  roleMiddleware("Head Shepherd", "System Admin"),
+  async (req, res) => {
+    try {
+      const { quarter } = req.body; // optional: "Q1 2025" → parse year+qtr
+      let targetDate = new Date();
+      if (quarter) {
+        const [q, yr] = quarter.split(" ");
+        const qIdx = { Q1: 0, Q2: 1, Q3: 2, Q4: 3 }[q] || 0;
+        targetDate = new Date(parseInt(yr), qIdx * 3 + 1, 1);
+      } else {
+        targetDate.setMonth(targetDate.getMonth() - 1);
+      }
+      const result = await runQuarterlyStatusUpdate(targetDate);
+      res.json({ success: true, ...result });
+    } catch (e) {
+      res.status(500).json({ error: e.message });
+    }
+  },
+);
+
+// PATCH /api/status-updates/:id/review — GL approves or rejects a pending update
+app.patch(
+  "/api/status-updates/:id/review",
+  authMiddleware,
+  roleMiddleware("Group Leader", "Head Shepherd", "System Admin"),
+  async (req, res) => {
+    try {
+      const { action, note } = req.body; // action: "approve" | "reject"
+      const record = await StatusUpdate.findById(req.params.id);
+      if (!record) return res.status(404).json({ error: "Record not found" });
+      if (record.status !== "pending")
+        return res.status(400).json({ error: "Not pending" });
+      if (req.user.role === "Group Leader" && record.group !== req.user.group)
+        return res.status(403).json({ error: "Not your group" });
+
+      record.status = action === "approve" ? "approved" : "rejected";
+      record.reviewedBy = req.user._id;
+      record.reviewedByName = req.user.fullName;
+      record.reviewedAt = new Date();
+      record.rejectionNote = action === "reject" ? note || "" : undefined;
+      if (action === "approve") record.appliedAt = new Date();
+      await record.save();
+
+      if (action === "approve") {
+        await Member.findByIdAndUpdate(record.memberId, {
+          membershipStatus: record.toStatus,
+        });
+        await User.findOneAndUpdate(
+          { phoneNumber: record.memberPhone },
+          { membershipStatus: record.toStatus },
+        );
+        // Notify member of approval
+        const memberUser = await User.findOne({
+          phoneNumber: record.memberPhone,
+        });
+        if (memberUser) {
+          const dirEmoji = record.direction === "up" ? "📈" : "📉";
+          await sendSystemNotification(
+            `${dirEmoji} Status Update Approved`,
+            `Your membership status has been updated from "${record.fromStatus}" to "${record.toStatus}" for ${record.quarter}. Approved by ${req.user.fullName}.`,
+            "personal",
+            null,
+            memberUser._id,
+          );
+        }
+        // Notify head shepherds
+        const headShepherds = await User.find({
+          role: { $in: ["Head Shepherd", "Branch Head Shepherd"] },
+        });
+        for (const hs of headShepherds) {
+          await sendSystemNotification(
+            `✅ Status Approved — ${record.memberName}`,
+            `${req.user.fullName} approved the status change for ${record.memberName} (${record.group}): "${record.fromStatus}" → "${record.toStatus}" (${record.quarter}).`,
+            "report",
+            null,
+            hs._id,
+          );
+        }
+      } else {
+        // Notify member of rejection
+        const memberUser = await User.findOne({
+          phoneNumber: record.memberPhone,
+        });
+        if (memberUser) {
+          await sendSystemNotification(
+            `ℹ️ Status Review Update`,
+            `Your pending status change from "${record.fromStatus}" to "${record.toStatus}" for ${record.quarter} was reviewed by ${req.user.fullName}.${note ? " Note: " + note : ""}`,
+            "personal",
+            null,
+            memberUser._id,
+          );
+        }
+      }
+
+      await logActivity(
+        `STATUS_${action.toUpperCase()}`,
+        req.user,
+        `${record.memberName} (${record.group}): ${record.fromStatus} → ${record.toStatus} | ${record.quarter}`,
+      );
+
+      res.json({ success: true, record });
+    } catch (e) {
+      res.status(500).json({ error: e.message });
+    }
+  },
+);
+
+// GET /api/status-updates/quarters — list distinct quarters available
+app.get("/api/status-updates/quarters", authMiddleware, async (req, res) => {
+  try {
+    const quarters = await StatusUpdate.distinct("quarter");
+    res.json(quarters.sort().reverse());
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 cron.schedule("0 7 * * 1", async () => {
   try {
     console.log("⏰ Running weekly inconsistency check...");
