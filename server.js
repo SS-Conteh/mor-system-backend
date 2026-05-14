@@ -484,6 +484,94 @@ const StatusUpdateSchema = new mongoose.Schema({
 });
 const StatusUpdate = mongoose.model("StatusUpdate", StatusUpdateSchema);
 
+// ── Status Change Log — permanent audit trail of every status change ──────────
+// Written on: auto-engine runs, GL approve/reject, manual PUT /members/:id edits
+const StatusChangeLogSchema = new mongoose.Schema({
+  memberId: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: "Member",
+    required: true,
+  },
+  memberName: { type: String, required: true },
+  memberPhone: String,
+  group: String,
+  branch: { type: String, default: "MOR Head Quarter" },
+  fromStatus: { type: String, required: true },
+  toStatus: { type: String, required: true },
+  direction: { type: String, enum: ["up", "down", "manual"], required: true },
+  attendancePct: Number,
+  attended: Number,
+  totalSessions: Number,
+  quarter: { type: String, required: true },
+  changeType: {
+    type: String,
+    enum: ["auto", "approved", "manual"],
+    required: true,
+  },
+  changedBy: { type: mongoose.Schema.Types.ObjectId, ref: "User" },
+  changedByName: String,
+  statusUpdateRef: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: "StatusUpdate",
+  },
+  loggedAt: { type: Date, default: Date.now },
+});
+StatusChangeLogSchema.index({ quarter: 1, group: 1 });
+StatusChangeLogSchema.index({ memberId: 1, quarter: 1 });
+const StatusChangeLog = mongoose.model(
+  "StatusChangeLog",
+  StatusChangeLogSchema,
+);
+
+// Helper: write one log entry (fire-and-forget safe)
+async function writeStatusLog({
+  memberId,
+  memberName,
+  memberPhone,
+  group,
+  branch,
+  fromStatus,
+  toStatus,
+  direction,
+  attendancePct,
+  attended,
+  totalSessions,
+  quarter,
+  changeType,
+  changedBy,
+  changedByName,
+  statusUpdateRef,
+}) {
+  try {
+    await StatusChangeLog.create({
+      memberId,
+      memberName,
+      memberPhone,
+      group,
+      branch: branch || "MOR Head Quarter",
+      fromStatus,
+      toStatus,
+      direction,
+      attendancePct,
+      attended,
+      totalSessions,
+      quarter,
+      changeType,
+      changedBy: changedBy || null,
+      changedByName: changedByName || null,
+      statusUpdateRef: statusUpdateRef || null,
+    });
+  } catch (e) {
+    console.error("StatusChangeLog write error:", e.message);
+  }
+}
+
+// Helper: get current quarter label
+function currentQuarterLabel(d = new Date()) {
+  const q = Math.floor(d.getMonth() / 3) + 1;
+  return `Q${q} ${d.getFullYear()}`;
+}
+
 // ========== AUTH MIDDLEWARE ==========
 const authMiddleware = async (req, res, next) => {
   try {
@@ -1074,6 +1162,44 @@ app.put("/api/members/:id", authMiddleware, async (req, res) => {
         { profilePhoto: req.body.profilePhoto },
         { runValidators: false },
       );
+    // ── If membershipStatus changed, write a StatusChangeLog entry ──
+    if (
+      req.body.membershipStatus &&
+      req.body.membershipStatus !== member.membershipStatus
+    ) {
+      const oldStatus = member.membershipStatus;
+      const newStatus = req.body.membershipStatus;
+      const statusOrder = [
+        "First Timer",
+        "Inconsistent",
+        "Semi-Consistent",
+        "Consistent",
+        "Intense Leader",
+        "Leader",
+      ];
+      const oldIdx = statusOrder.indexOf(oldStatus);
+      const newIdx = statusOrder.indexOf(newStatus);
+      const direction =
+        newIdx > oldIdx ? "up" : newIdx < oldIdx ? "down" : "manual";
+      await writeStatusLog({
+        memberId: member._id,
+        memberName: member.fullName,
+        memberPhone: member.phoneNumber,
+        group: member.group,
+        branch: member.branch || "MOR Head Quarter",
+        fromStatus: oldStatus,
+        toStatus: newStatus,
+        direction,
+        attendancePct: null,
+        attended: null,
+        totalSessions: null,
+        quarter: currentQuarterLabel(),
+        changeType: "manual",
+        changedBy: req.user._id,
+        changedByName: req.user.fullName,
+      });
+    }
+
     await logActivity(`updated member ${member.fullName}`, req.user);
     res.json(updatedMember);
   } catch (error) {
@@ -3315,6 +3441,23 @@ async function runQuarterlyStatusUpdate(quarterDate) {
             { membershipStatus: result.toStatus },
           );
           totalUpdated++;
+          // ── Log to StatusChangeLog ──
+          await writeStatusLog({
+            memberId: member._id,
+            memberName: member.fullName,
+            memberPhone: member.phoneNumber,
+            group: group.name,
+            branch: member.branch || group.branch || "MOR Head Quarter",
+            fromStatus: member.membershipStatus,
+            toStatus: result.toStatus,
+            direction,
+            attendancePct: pct,
+            attended,
+            totalSessions,
+            quarter: quarterLabel,
+            changeType: "auto",
+            statusUpdateRef: record._id,
+          });
         } else {
           totalPending++;
         }
@@ -3482,6 +3625,25 @@ app.patch(
           { phoneNumber: record.memberPhone },
           { membershipStatus: record.toStatus },
         );
+        // ── Log approved change to StatusChangeLog ──
+        await writeStatusLog({
+          memberId: record.memberId,
+          memberName: record.memberName,
+          memberPhone: record.memberPhone,
+          group: record.group,
+          branch: record.branch,
+          fromStatus: record.fromStatus,
+          toStatus: record.toStatus,
+          direction: record.direction,
+          attendancePct: record.attendancePct,
+          attended: record.attended,
+          totalSessions: record.totalSessions,
+          quarter: record.quarter,
+          changeType: "approved",
+          changedBy: req.user._id,
+          changedByName: req.user.fullName,
+          statusUpdateRef: record._id,
+        });
         // Notify member of approval
         const memberUser = await User.findOne({
           phoneNumber: record.memberPhone,
@@ -3547,6 +3709,139 @@ app.get("/api/status-updates/quarters", authMiddleware, async (req, res) => {
     res.status(500).json({ error: e.message });
   }
 });
+
+// ── GET /api/status-change-log — fetch the audit log ─────────────────────────
+// GL sees their own group; HS/Admin see all or filtered by group/quarter
+app.get("/api/status-change-log", authMiddleware, async (req, res) => {
+  try {
+    const { quarter, group, changeType, limit = 500 } = req.query;
+    const query = {};
+
+    // Scope by role
+    if (req.user.role === "Group Leader") {
+      query.group = req.user.group;
+    } else if (req.user.role === "Branch Head Shepherd") {
+      query.branch = req.user.branch;
+    }
+
+    // Optional filters from query string
+    if (quarter) query.quarter = quarter;
+    if (changeType) query.changeType = changeType;
+    if (
+      group &&
+      ["Head Shepherd", "Branch Head Shepherd", "System Admin"].includes(
+        req.user.role,
+      )
+    ) {
+      query.group = group;
+    }
+
+    const logs = await StatusChangeLog.find(query)
+      .sort({ loggedAt: -1 })
+      .limit(parseInt(limit));
+
+    res.json(logs);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ── GET /api/status-change-log/quarters — distinct quarters in the log ─────────
+app.get("/api/status-change-log/quarters", authMiddleware, async (req, res) => {
+  try {
+    const query = {};
+    if (req.user.role === "Group Leader") query.group = req.user.group;
+    else if (req.user.role === "Branch Head Shepherd")
+      query.branch = req.user.branch;
+    const quarters = await StatusChangeLog.distinct("quarter", query);
+    res.json(quarters.sort().reverse());
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ── POST /api/status-change-log — frontend-triggered save (e.g. register auto-detect) ──
+// The register shows auto-detected changes visually; this endpoint saves them to the DB
+// so they appear in the log even before the quarterly engine runs.
+app.post(
+  "/api/status-change-log",
+  authMiddleware,
+  roleMiddleware("Group Leader", "Head Shepherd", "System Admin"),
+  async (req, res) => {
+    try {
+      const {
+        memberId,
+        memberName,
+        memberPhone,
+        group,
+        branch,
+        fromStatus,
+        toStatus,
+        direction,
+        attendancePct,
+        attended,
+        totalSessions,
+        quarter,
+        changeType,
+        statusUpdateRef,
+      } = req.body;
+
+      // Prevent duplicate entries for same member + quarter + toStatus + changeType
+      const existing = await StatusChangeLog.findOne({
+        memberId,
+        quarter,
+        toStatus,
+        changeType,
+      });
+      if (existing) return res.json({ duplicate: true, log: existing });
+
+      // If changeType is "auto" — also apply to Member + User records immediately
+      if (changeType === "auto") {
+        const member = await Member.findById(memberId);
+        if (!member) return res.status(404).json({ error: "Member not found" });
+        if (req.user.role === "Group Leader" && member.group !== req.user.group)
+          return res.status(403).json({ error: "Not your group" });
+
+        await Member.findByIdAndUpdate(memberId, {
+          membershipStatus: toStatus,
+        });
+        await User.findOneAndUpdate(
+          { phoneNumber: memberPhone },
+          { membershipStatus: toStatus },
+        );
+      }
+
+      const log = await writeStatusLog({
+        memberId,
+        memberName,
+        memberPhone,
+        group: group || req.user.group,
+        branch: branch || "MOR Head Quarter",
+        fromStatus,
+        toStatus,
+        direction,
+        attendancePct: attendancePct ?? null,
+        attended: attended ?? null,
+        totalSessions: totalSessions ?? null,
+        quarter: quarter || currentQuarterLabel(),
+        changeType: changeType || "manual",
+        changedBy: req.user._id,
+        changedByName: req.user.fullName,
+        statusUpdateRef: statusUpdateRef || null,
+      });
+
+      await logActivity(
+        `STATUS_LOG_${(changeType || "manual").toUpperCase()}`,
+        req.user,
+        `${memberName}: ${fromStatus} → ${toStatus} | ${quarter}`,
+      );
+
+      res.status(201).json({ success: true });
+    } catch (e) {
+      res.status(500).json({ error: e.message });
+    }
+  },
+);
 
 cron.schedule("0 7 * * 1", async () => {
   try {
