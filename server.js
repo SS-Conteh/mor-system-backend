@@ -498,7 +498,11 @@ const StatusChangeLogSchema = new mongoose.Schema({
   branch: { type: String, default: "MOR Head Quarter" },
   fromStatus: { type: String, required: true },
   toStatus: { type: String, required: true },
-  direction: { type: String, enum: ["up", "down", "manual"], required: true },
+  direction: {
+    type: String,
+    enum: ["up", "down", "manual", "none"],
+    required: true,
+  },
   attendancePct: Number,
   attended: Number,
   totalSessions: Number,
@@ -3536,6 +3540,55 @@ async function runQuarterlyStatusUpdate(quarterDate) {
 cron.schedule("0 8 1 1,4,7,10 *", async () => {
   const prevQtrDate = new Date();
   prevQtrDate.setMonth(prevQtrDate.getMonth() - 1); // roll back to the quarter just ended
+  const prevQtrLabel = getQuarterLabel(prevQtrDate);
+
+  // ── Expire any pending StatusUpdate records from the quarter that just closed ──
+  // A pending record that reaches quarter-end without GL approval means the member
+  // stays at their original (fromStatus) — no status change is applied.
+  // We mark the record as "rejected" with an automatic note so it no longer
+  // appears as actionable and the UI can display the correct outcome.
+  try {
+    const expiredPending = await StatusUpdate.find({
+      quarter: prevQtrLabel,
+      status: "pending",
+    });
+    for (const rec of expiredPending) {
+      rec.status = "rejected";
+      rec.rejectionNote =
+        "Quarter ended without approval — member kept original status (" +
+        rec.fromStatus +
+        ").";
+      rec.reviewedAt = new Date();
+      await rec.save();
+      // Log the expiry so the Status Change Log reflects it
+      await writeStatusLog({
+        memberId: rec.memberId,
+        memberName: rec.memberName,
+        memberPhone: rec.memberPhone,
+        group: rec.group,
+        branch: rec.branch,
+        fromStatus: rec.fromStatus,
+        toStatus: rec.fromStatus, // kept at original
+        direction: "none",
+        attendancePct: rec.attendancePct,
+        attended: rec.attended,
+        totalSessions: rec.totalSessions,
+        quarter: prevQtrLabel,
+        changeType: "auto",
+        statusUpdateRef: rec._id,
+      });
+      console.log(
+        `⏰ Expired pending: ${rec.memberName} stayed at ${rec.fromStatus} (${prevQtrLabel})`,
+      );
+    }
+    if (expiredPending.length)
+      console.log(
+        `⏰ Expired ${expiredPending.length} pending record(s) for ${prevQtrLabel}`,
+      );
+  } catch (e) {
+    console.error("❌ Error expiring pending records:", e.message);
+  }
+
   await runQuarterlyStatusUpdate(prevQtrDate);
 });
 
