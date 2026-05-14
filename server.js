@@ -3623,6 +3623,58 @@ app.get("/api/status-updates", authMiddleware, async (req, res) => {
   }
 });
 
+// POST /api/status-updates — create a pending record from the GL frontend.
+// The quarterly engine normally does this via cron, but the GL register
+// also creates pending records on-the-fly so the Review button appears
+// without waiting for the cron. Duplicates are silently ignored.
+app.post(
+  "/api/status-updates",
+  authMiddleware,
+  roleMiddleware("Group Leader", "Head Shepherd", "Branch Head Shepherd", "System Admin"),
+  async (req, res) => {
+    try {
+      const {
+        memberId, memberName, memberPhone, group, branch,
+        fromStatus, toStatus, direction, attendancePct,
+        attended, totalSessions, quarter, status,
+      } = req.body;
+
+      // Only allow pending records through this endpoint — auto records are
+      // written by the engine or the status-change-log endpoint.
+      if (status !== "pending") {
+        return res.status(400).json({ error: "Only pending records can be created here." });
+      }
+
+      // Prevent duplicates: same member + quarter + toStatus
+      const existing = await StatusUpdate.findOne({
+        memberId,
+        quarter,
+        toStatus,
+      });
+      if (existing) return res.json(existing); // return the existing record silently
+
+      const record = await StatusUpdate.create({
+        memberId,
+        memberName,
+        memberPhone,
+        group: group || req.user.group,
+        branch: branch || req.user.branch || "MOR Head Quarter",
+        fromStatus,
+        toStatus,
+        direction,
+        attendancePct,
+        attended,
+        totalSessions: totalSessions || 13,
+        quarter,
+        status: "pending",
+      });
+      res.status(201).json(record);
+    } catch (e) {
+      res.status(500).json({ error: e.message });
+    }
+  },
+);
+
 // POST /api/status-updates/run — manual trigger (HS/Admin only)
 app.post(
   "/api/status-updates/run",
