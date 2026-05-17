@@ -1793,7 +1793,19 @@ app.get("/api/attendance", authMiddleware, async (req, res) => {
       });
       if (member) query["records.memberId"] = member._id;
     } else if (req.user.role === "Group Leader" && req.user.group) {
-      if (!group) query.group = req.user.group;
+      if (!group) {
+        // Include records for this group AND records saved with no group (group: null)
+        // which is how "All Groups" attendance is stored when head/branch shepherd marks
+        // the register for all groups at once. Use $or so both are returned.
+        // Also scope to the leader's branch if available to avoid cross-branch leakage.
+        const glBranchFilter = req.user.branch
+          ? { branch: req.user.branch }
+          : {};
+        query.$or = [
+          { group: req.user.group },
+          { group: null, ...glBranchFilter },
+        ];
+      }
     } else if (req.user.role === "Branch Head Shepherd" && req.user.branch) {
       if (!branch) {
         // Find all groups in this branch so QR-created records (which always
@@ -3630,19 +3642,36 @@ app.get("/api/status-updates", authMiddleware, async (req, res) => {
 app.post(
   "/api/status-updates",
   authMiddleware,
-  roleMiddleware("Group Leader", "Head Shepherd", "Branch Head Shepherd", "System Admin"),
+  roleMiddleware(
+    "Group Leader",
+    "Head Shepherd",
+    "Branch Head Shepherd",
+    "System Admin",
+  ),
   async (req, res) => {
     try {
       const {
-        memberId, memberName, memberPhone, group, branch,
-        fromStatus, toStatus, direction, attendancePct,
-        attended, totalSessions, quarter, status,
+        memberId,
+        memberName,
+        memberPhone,
+        group,
+        branch,
+        fromStatus,
+        toStatus,
+        direction,
+        attendancePct,
+        attended,
+        totalSessions,
+        quarter,
+        status,
       } = req.body;
 
       // Only allow pending records through this endpoint — auto records are
       // written by the engine or the status-change-log endpoint.
       if (status !== "pending") {
-        return res.status(400).json({ error: "Only pending records can be created here." });
+        return res
+          .status(400)
+          .json({ error: "Only pending records can be created here." });
       }
 
       // Prevent duplicates: same member + quarter + toStatus
