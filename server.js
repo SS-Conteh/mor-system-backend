@@ -1793,19 +1793,17 @@ app.get("/api/attendance", authMiddleware, async (req, res) => {
       });
       if (member) query["records.memberId"] = member._id;
     } else if (req.user.role === "Group Leader" && req.user.group) {
-      if (!group) {
-        // Include records for this group AND records saved with no group (group: null)
-        // which is how "All Groups" attendance is stored when head/branch shepherd marks
-        // the register for all groups at once. Use $or so both are returned.
-        // Also scope to the leader's branch if available to avoid cross-branch leakage.
-        const glBranchFilter = req.user.branch
-          ? { branch: req.user.branch }
-          : {};
-        query.$or = [
-          { group: req.user.group },
-          { group: null, ...glBranchFilter },
-        ];
-      }
+      // ALWAYS include records for this leader's group AND records saved with
+      // group: null (i.e. "All Groups" marked by head/branch shepherd).
+      // Remove any exact-group filter already set above and replace with $or
+      // so "All Groups" dates/records are never invisible to the group leader,
+      // regardless of whether a ?group= param was passed by the frontend.
+      const glBranchFilter = req.user.branch ? { branch: req.user.branch } : {};
+      delete query.group;
+      query.$or = [
+        { group: req.user.group },
+        { group: null, ...glBranchFilter },
+      ];
     } else if (req.user.role === "Branch Head Shepherd" && req.user.branch) {
       if (!branch) {
         // Find all groups in this branch so QR-created records (which always
