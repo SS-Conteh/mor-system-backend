@@ -1135,11 +1135,90 @@ app.put("/api/members/:id", authMiddleware, async (req, res) => {
 
     // ── FIX #3: Handle role field update — also sync User table role ──
     const updateData = { ...req.body, updatedAt: new Date() };
+
+    // ── TRANSFER FIX: Capture old branch/group before updating ──
+    const oldBranch = member.branch || "MOR Head Quarter";
+    const oldGroup = member.group || null;
+    const newBranch =
+      req.body.branch !== undefined
+        ? req.body.branch || "MOR Head Quarter"
+        : oldBranch;
+    const newGroup =
+      req.body.group !== undefined ? req.body.group || null : oldGroup;
+    const branchChanged = newBranch !== oldBranch;
+    const groupChanged = newGroup !== oldGroup;
+
     const updatedMember = await Member.findByIdAndUpdate(
       req.params.id,
       updateData,
       { new: true, runValidators: false },
     );
+
+    // ── TRANSFER FIX: When branch or group changes, migrate all Attendance
+    //    records that contain this member so they remain visible in the new
+    //    branch/group context.  We update every Attendance document whose
+    //    records[] array includes this memberId AND whose branch/group still
+    //    matches the old values (i.e. the session was recorded while the
+    //    member was in the old location).  We do NOT touch sessions from
+    //    a different branch/group — those belong to other members' history.
+    // ──────────────────────────────────────────────────────────────────────
+    if (branchChanged || groupChanged) {
+      // Build a filter that matches sessions tied to the member's OLD location
+      const sessionFilter = { "records.memberId": member._id };
+      if (oldGroup) {
+        // Session was saved for the old group (or null = "All Groups")
+        sessionFilter.$or = [{ group: oldGroup }, { group: null }];
+      } else {
+        // Member had no group — match sessions with no group assigned
+        sessionFilter.group = null;
+      }
+      if (oldBranch && oldBranch !== "MOR Head Quarter") {
+        sessionFilter.branch = oldBranch;
+      }
+
+      // Build the fields to update on those sessions
+      const sessionUpdate = {};
+      if (branchChanged) sessionUpdate.branch = newBranch;
+      if (groupChanged) sessionUpdate.group = newGroup;
+
+      await Attendance.updateMany(sessionFilter, { $set: sessionUpdate });
+
+      // Also update the memberName snapshot inside each record sub-document
+      // in case the full name was changed at the same time as the transfer.
+      if (req.body.fullName && req.body.fullName !== member.fullName) {
+        await Attendance.updateMany(
+          { "records.memberId": member._id },
+          {
+            $set: {
+              "records.$[elem].memberName": req.body.fullName,
+            },
+          },
+          {
+            arrayFilters: [{ "elem.memberId": member._id }],
+            multi: true,
+          },
+        );
+      }
+
+      // Decrement old group member count; increment new group member count
+      if (groupChanged) {
+        if (oldGroup)
+          await Group.findOneAndUpdate(
+            { name: oldGroup },
+            { $inc: { memberCount: -1 } },
+          );
+        if (newGroup)
+          await Group.findOneAndUpdate(
+            { name: newGroup },
+            { $inc: { memberCount: 1 } },
+          );
+      }
+
+      await logActivity(
+        `transferred member ${member.fullName} from ${oldBranch}/${oldGroup || "no group"} to ${newBranch}/${newGroup || "no group"} — attendance records migrated`,
+        req.user,
+      );
+    }
 
     // Sync role to User table if role changed
     if (req.body.role) {
