@@ -1874,14 +1874,14 @@ app.get("/api/attendance", authMiddleware, async (req, res) => {
     } else if (req.user.role === "Group Leader" && req.user.group) {
       // ALWAYS include records for this leader's group AND records saved with
       // group: null (i.e. "All Groups" marked by head/branch shepherd).
-      // Remove any exact-group filter already set above and replace with $or
-      // so "All Groups" dates/records are never invisible to the group leader,
-      // regardless of whether a ?group= param was passed by the frontend.
+      // Also include records with branch: null (saved by Head Shepherd for all branches).
       const glBranchFilter = req.user.branch ? { branch: req.user.branch } : {};
       delete query.group;
       query.$or = [
         { group: req.user.group },
         { group: null, ...glBranchFilter },
+        // Head Shepherd "All Branches / All Groups" records have branch:null, group:null
+        { group: null, branch: null },
       ];
     } else if (req.user.role === "Branch Head Shepherd" && req.user.branch) {
       if (!branch) {
@@ -1893,6 +1893,8 @@ app.get("/api/attendance", authMiddleware, async (req, res) => {
         query.$or = [
           { branch: req.user.branch },
           { group: { $in: branchGroupDocs.filter(Boolean) } },
+          // Head Shepherd "All Branches" records have branch: null — include them
+          { branch: null },
         ];
       }
     }
