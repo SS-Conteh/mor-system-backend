@@ -2248,12 +2248,15 @@ app.delete(
 );
 
 // ========== CBS LOCATIONS ==========
-app.get("/api/cbs-locations", async (req, res) => {
+app.get("/api/cbs-locations", authMiddleware, async (req, res) => {
   try {
     const query = {};
-    if (req.query.branch) query.branch = req.query.branch;
-    else if (req.user?.role === "Branch Head Shepherd")
+    if (req.query.branch) {
+      query.branch = req.query.branch;
+    } else if (req.user?.role === "Branch Head Shepherd" && req.user.branch) {
+      // Auto-scope to the shepherd's branch so they only see their own locations
       query.branch = req.user.branch;
+    }
     res.json(await CBSLocation.find(query));
   } catch (error) {
     res.status(500).json({ error: "Server error" });
