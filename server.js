@@ -1851,7 +1851,9 @@ app.get("/api/attendance", authMiddleware, async (req, res) => {
     const { type, group, cbsLocation, date, branch } = req.query;
     let query = {};
     if (type) query.type = type;
-    if (group && group !== "" && group !== "null") query.group = group;
+    const groupFilter =
+      group && group !== "" && group !== "null" ? group : null;
+    if (groupFilter) query.group = groupFilter;
     if (cbsLocation) query.cbsLocation = cbsLocation;
     if (branch) {
       query.branch = branch;
@@ -1890,12 +1892,24 @@ app.get("/api/attendance", authMiddleware, async (req, res) => {
         const branchGroupDocs = await Member.distinct("group", {
           branch: req.user.branch,
         }).catch(() => []);
-        query.$or = [
-          { branch: req.user.branch },
-          { group: { $in: branchGroupDocs.filter(Boolean) } },
-          // Head Shepherd "All Branches" records have branch: null — include them
-          { branch: null },
-        ];
+
+        if (groupFilter) {
+          // When filtering by a specific group, also include null-group (All Groups)
+          // records from this branch, since those sessions include everyone
+          delete query.group;
+          query.$or = [
+            { group: groupFilter, branch: req.user.branch },
+            { group: null, branch: req.user.branch },
+            { group: null, branch: null },
+          ];
+        } else {
+          query.$or = [
+            { branch: req.user.branch },
+            { group: { $in: branchGroupDocs.filter(Boolean) } },
+            // Head Shepherd "All Branches" records have branch: null — include them
+            { branch: null },
+          ];
+        }
       }
     }
     const records = await Attendance.find(query).sort({ date: -1 }).lean();
