@@ -1895,18 +1895,23 @@ app.get("/api/attendance", authMiddleware, async (req, res) => {
 
         if (groupFilter) {
           // When filtering by a specific group, also include null-group (All Groups)
-          // records from this branch, since those sessions include everyone
+          // records from this branch. Remove any top-level branch/group fields first
+          // so they don't AND against $or and block null-branch records.
           delete query.group;
+          delete query.branch;
           query.$or = [
             { group: groupFilter, branch: req.user.branch },
             { group: null, branch: req.user.branch },
             { group: null, branch: null },
           ];
         } else {
+          // No specific group filter — show all sessions for this branch,
+          // including any Head Shepherd "All Branches" (branch: null) records.
+          // Must delete query.branch before using $or so both conditions are checked.
+          delete query.branch;
           query.$or = [
             { branch: req.user.branch },
             { group: { $in: branchGroupDocs.filter(Boolean) } },
-            // Head Shepherd "All Branches" records have branch: null — include them
             { branch: null },
           ];
         }
