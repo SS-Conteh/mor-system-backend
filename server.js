@@ -2766,15 +2766,11 @@ app.get("/api/qr/sessions", authMiddleware, async (req, res) => {
         $or: [{ group: req.user.group }, { "scans.group": req.user.group }],
       };
     } else if (req.user.role === "Branch Head Shepherd") {
-      // Show sessions created by this branch, created by this user,
-      // OR any session where a member from this branch has scanned
+      // Show only sessions created by this branch shepherd or explicitly for this branch.
+      // HQ-generated QR sessions are excluded even if branch members have scanned them.
       if (req.user.branch) {
         query = {
-          $or: [
-            { branch: req.user.branch },
-            { createdBy: req.user._id },
-            { "scans.branch": req.user.branch },
-          ],
+          $or: [{ branch: req.user.branch }, { createdBy: req.user._id }],
         };
       } else {
         query.createdBy = req.user._id;
