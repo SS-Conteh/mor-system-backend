@@ -1855,12 +1855,45 @@ app.get("/api/attendance", authMiddleware, async (req, res) => {
       group && group !== "" && group !== "null" ? group : null;
     if (groupFilter) query.group = groupFilter;
     if (cbsLocation) query.cbsLocation = cbsLocation;
-    if (branch) {
+    // For Branch Head Shepherd: ignore any explicit branch/group query params and
+    // always build the query from their authenticated branch + the group filter.
+    // This ensures null-group ("All Groups") sessions are always included.
+    if (req.user.role === "Branch Head Shepherd" && req.user.branch) {
+      // Always scope to this shepherd's branch — ignore any branch param from frontend
+      const myBranch = req.user.branch;
+
+      // Find all groups in this branch for QR-created records
+      const branchGroupDocs = await Member.distinct("group", {
+        branch: myBranch,
+      }).catch(() => []);
+
+      // Always clear any top-level branch/group that may have been set above,
+      // since $or will fully control the branch/group matching.
+      delete query.branch;
+      delete query.group;
+
+      if (groupFilter) {
+        // Specific group selected: return sessions saved for that group OR
+        // sessions saved for the whole branch (group: null) — both contain
+        // this group's members when marked under "All Groups".
+        query.$or = [
+          { group: groupFilter, branch: myBranch },
+          { group: null, branch: myBranch },
+          { group: null, branch: null },
+        ];
+      } else {
+        // All Groups: return every session for this branch including
+        // Head Shepherd cross-branch (branch: null) records.
+        query.$or = [
+          { branch: myBranch },
+          { group: { $in: branchGroupDocs.filter(Boolean) } },
+          { branch: null },
+        ];
+      }
+    } else if (branch) {
       query.branch = branch;
-    } else if (req.user.role === "Branch Head Shepherd" && req.user.branch) {
-      // Auto-scope attendance to Branch Head Shepherd's branch
-      query.branch = req.user.branch;
     }
+
     if (date) {
       const start = new Date(date);
       start.setHours(0, 0, 0, 0);
@@ -1882,40 +1915,8 @@ app.get("/api/attendance", authMiddleware, async (req, res) => {
       query.$or = [
         { group: req.user.group },
         { group: null, ...glBranchFilter },
-        // Head Shepherd "All Branches / All Groups" records have branch:null, group:null
         { group: null, branch: null },
       ];
-    } else if (req.user.role === "Branch Head Shepherd" && req.user.branch) {
-      if (!branch) {
-        // Find all groups in this branch so QR-created records (which always
-        // have a group field set) are included even if their branch field is missing
-        const branchGroupDocs = await Member.distinct("group", {
-          branch: req.user.branch,
-        }).catch(() => []);
-
-        if (groupFilter) {
-          // When filtering by a specific group, also include null-group (All Groups)
-          // records from this branch. Remove any top-level branch/group fields first
-          // so they don't AND against $or and block null-branch records.
-          delete query.group;
-          delete query.branch;
-          query.$or = [
-            { group: groupFilter, branch: req.user.branch },
-            { group: null, branch: req.user.branch },
-            { group: null, branch: null },
-          ];
-        } else {
-          // No specific group filter — show all sessions for this branch,
-          // including any Head Shepherd "All Branches" (branch: null) records.
-          // Must delete query.branch before using $or so both conditions are checked.
-          delete query.branch;
-          query.$or = [
-            { branch: req.user.branch },
-            { group: { $in: branchGroupDocs.filter(Boolean) } },
-            { branch: null },
-          ];
-        }
-      }
     }
     const records = await Attendance.find(query).sort({ date: -1 }).lean();
     res.json(records);
