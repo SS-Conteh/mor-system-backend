@@ -1890,6 +1890,25 @@ app.get("/api/attendance", authMiddleware, async (req, res) => {
           { branch: null },
         ];
       }
+    } else if (
+      (req.user.role === "Head Shepherd" || req.user.role === "System Admin") &&
+      branch
+    ) {
+      // Head Shepherd querying a specific branch: return sessions for that branch
+      // including null-group (All Groups) sessions. When a group filter is also
+      // present, include both group-specific AND null-group sessions so history
+      // always shows records that were saved under "All Groups".
+      delete query.group;
+      delete query.branch;
+      if (groupFilter) {
+        query.$or = [
+          { group: groupFilter, branch: branch },
+          { group: null, branch: branch },
+          { group: null, branch: null },
+        ];
+      } else {
+        query.$or = [{ branch: branch }, { branch: null }];
+      }
     } else if (branch) {
       query.branch = branch;
     }
