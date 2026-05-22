@@ -2391,7 +2391,7 @@ app.delete(
 );
 
 // ========== CBS LOCATIONS ==========
-app.get("/api/cbs-locations", authMiddleware, async (req, res) => {
+app.get("/api/cbs-locations", optionalAuth, async (req, res) => {
   try {
     const query = {};
     if (req.query.branch) {
