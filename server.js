@@ -732,6 +732,87 @@ async function logActivity(action, user, details = "") {
   }).catch(() => {});
 }
 
+/**
+ * backfillAbsentForNewMember
+ * ─────────────────────────────────────────────────────────────────────────────
+ * When a new member registers they were obviously absent from every session
+ * that was already marked before they joined.  This function injects an
+ * "absent" record for them into every existing Attendance document that
+ * belongs to their group / branch and does NOT already contain their entry.
+ * Stats (total, absent, percentage) are recalculated accordingly.
+ *
+ * Called fire-and-forget from both registration routes so it never blocks
+ * the HTTP response.
+ */
+async function backfillAbsentForNewMember(member) {
+  try {
+    const { _id, fullName, group, branch } = member;
+
+    // Build a query that matches all sessions this member belongs to:
+    //   • sessions saved specifically for their group
+    //   • sessions saved for "All Groups" (group: null) in their branch
+    //   • sessions saved across all branches (branch: null, group: null) — Head Shepherd records
+    const sessionQuery = {
+      $or: [
+        // Their exact group (any branch)
+        ...(group ? [{ group }] : []),
+        // Branch-wide "All Groups" sessions
+        ...(branch ? [{ group: null, branch }] : []),
+        // Cross-branch "All Groups" sessions recorded by Head Shepherd
+        { group: null, branch: null },
+      ],
+      // Only sessions that do NOT already have a record for this member
+      "records.memberId": { $ne: _id },
+    };
+
+    // Safety: if no group AND no branch, nothing to backfill
+    if (!group && !branch) return;
+
+    const sessions = await Attendance.find(sessionQuery).lean();
+    if (!sessions.length) return;
+
+    for (const session of sessions) {
+      // Double-check the member is not already in this session by name either
+      // (handles edge-case where they were added manually before getting an _id)
+      const alreadyIn = session.records.some(
+        (r) =>
+          (r.memberId && r.memberId.toString() === _id.toString()) ||
+          r.memberName === fullName,
+      );
+      if (alreadyIn) continue;
+
+      // Inject the absent record
+      const newRecord = {
+        memberId: _id,
+        memberName: fullName,
+        status: "absent",
+        checkInTime: null,
+        scanMethod: "manual",
+      };
+
+      const updatedRecords = [...session.records, newRecord];
+      const total = updatedRecords.length;
+      const present = updatedRecords.filter(
+        (r) => r.status === "present",
+      ).length;
+
+      await Attendance.findByIdAndUpdate(session._id, {
+        $push: { records: newRecord },
+        $set: {
+          "stats.total": total,
+          "stats.present": present,
+          "stats.absent": total - present,
+          "stats.percentage":
+            total > 0 ? parseFloat(((present / total) * 100).toFixed(1)) : 0,
+        },
+      });
+    }
+  } catch (err) {
+    // Fire-and-forget — log but never crash the caller
+    console.error("backfillAbsentForNewMember error:", err.message);
+  }
+}
+
 async function sendSystemNotification(
   title,
   message,
@@ -870,6 +951,13 @@ app.post(
           addedByName: req.user.fullName,
         });
         await member.save();
+        // Fire-and-forget: inject this member as absent into all prior attendance
+        // sessions for their group/branch so records are complete from day one.
+        backfillAbsentForNewMember(member);
+      } else {
+        // Member record already existed — still backfill in case they were missing
+        // from attendance records (e.g. added to members list but never had an account).
+        backfillAbsentForNewMember(member);
       }
       if (member.group)
         await Group.findOneAndUpdate(
@@ -917,6 +1005,9 @@ app.post("/api/auth/register", async (req, res) => {
       addedByName: user.fullName,
     });
     await member.save();
+    // Fire-and-forget: inject this member as absent into all prior attendance
+    // sessions for their group/branch so records are complete from day one.
+    backfillAbsentForNewMember(member);
     const token = jwt.sign(
       { userId: user._id, role: user.role },
       process.env.JWT_SECRET,
@@ -2020,7 +2111,14 @@ app.get("/api/attendance", authMiddleware, async (req, res) => {
       const member = await Member.findOne({
         phoneNumber: req.user.phoneNumber,
       });
-      if (member) query["records.memberId"] = member._id;
+      if (member) {
+        // Match sessions where this member has a record — by memberId (backfilled)
+        // or by memberName (manually recorded before account existed).
+        query.$or = [
+          { "records.memberId": member._id },
+          { "records.memberName": member.fullName },
+        ];
+      }
     } else if (req.user.role === "Group Leader" && req.user.group) {
       // ALWAYS include records for this leader's group AND records saved with
       // group: null (i.e. "All Groups" marked by head/branch shepherd).
