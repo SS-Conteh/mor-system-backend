@@ -5062,6 +5062,16 @@ app.listen(PORT, "0.0.0.0", () => {
   console.log(`\n🚀 MOR System Backend Server v2.0`);
   console.log(`📡 Running on http://0.0.0.0:${PORT}`);
   console.log(`🔗 API: https://mor-system-backend.onrender.com/api`);
+
+  // Keep-alive: prevents Render free tier from spinning down
+  setInterval(
+    () => {
+      fetch("https://mor-system-backend.onrender.com/api/health").catch(
+        () => {},
+      );
+    },
+    14 * 60 * 1000,
+  );
 });
 
 module.exports = app;
