@@ -452,10 +452,8 @@ NotificationSchema.index({ sentBy: 1 });
 ActivityLogSchema.index({ branch: 1, createdAt: -1 });
 ActivityLogSchema.index({ createdAt: -1 });
 
-StatusUpdateSchema.index({ group: 1, quarter: 1 });
-StatusUpdateSchema.index({ branch: 1, quarter: 1 });
-StatusUpdateSchema.index({ memberId: 1, quarter: 1 });
-StatusUpdateSchema.index({ status: 1, quarter: 1 });
+// Note: StatusUpdateSchema and StatusChangeLogSchema indexes are defined
+// after those schemas are declared (further below), since they are defined later in the file.
 
 // Create Models
 const User = mongoose.model("User", UserSchema);
@@ -488,6 +486,9 @@ const FollowUpChatSchema = new mongoose.Schema({
   createdAt: { type: Date, default: Date.now },
 });
 const FollowUpChat = mongoose.model("FollowUpChat", FollowUpChatSchema);
+FollowUpChatSchema.index({ assignmentId: 1, createdAt: 1 });
+FollowUpChatSchema.index({ toMemberId: 1 });
+FollowUpChatSchema.index({ toName: 1 });
 
 // Bulk Import Log Model — tracks every excel upload by group leaders
 const BulkImportSchema = new mongoose.Schema({
@@ -543,6 +544,10 @@ const StatusUpdateSchema = new mongoose.Schema({
   createdAt: { type: Date, default: Date.now },
 });
 const StatusUpdate = mongoose.model("StatusUpdate", StatusUpdateSchema);
+StatusUpdateSchema.index({ group: 1, quarter: 1 });
+StatusUpdateSchema.index({ branch: 1, quarter: 1 });
+StatusUpdateSchema.index({ memberId: 1, quarter: 1 });
+StatusUpdateSchema.index({ status: 1, quarter: 1 });
 
 // ── Status Change Log — permanent audit trail of every status change ──────────
 // Written on: auto-engine runs, GL approve/reject, manual PUT /members/:id edits
