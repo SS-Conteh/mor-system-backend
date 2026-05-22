@@ -18,9 +18,13 @@ cloudinary.config({
   api_secret: process.env.CLOUDINARY_API_SECRET,
 });
 
+const compression = require("compression");
+
 const app = express();
 
 // ========== MIDDLEWARE ==========
+// Gzip/brotli compress all responses — reduces payload size 60-80% for JSON
+app.use(compression());
 app.use(
   cors({
     origin: [
@@ -397,6 +401,62 @@ const MediaSchema = new mongoose.Schema({
   createdAt: { type: Date, default: Date.now },
 });
 
+// ========== DATABASE INDEXES (critical for query performance) ==========
+// These ensure MongoDB can satisfy queries without full collection scans.
+// MongoDB only creates an index if it doesn't already exist (idempotent).
+UserSchema.index({ phoneNumber: 1 });
+UserSchema.index({ role: 1 });
+UserSchema.index({ group: 1 });
+UserSchema.index({ branch: 1 });
+
+MemberSchema.index({ phoneNumber: 1 });
+MemberSchema.index({ group: 1 });
+MemberSchema.index({ branch: 1 });
+MemberSchema.index({ membershipStatus: 1 });
+MemberSchema.index({ isSteward: 1 });
+MemberSchema.index({ group: 1, branch: 1 });
+MemberSchema.index({ assignedTo: 1 });
+MemberSchema.index({ createdAt: -1 });
+
+AttendanceSchema.index({ type: 1, date: -1 });
+AttendanceSchema.index({ group: 1, type: 1, date: -1 });
+AttendanceSchema.index({ branch: 1, type: 1, date: -1 });
+AttendanceSchema.index({ cbsLocation: 1, type: 1, date: -1 });
+AttendanceSchema.index({ "records.memberId": 1 });
+AttendanceSchema.index({ date: -1 });
+
+GroupSchema.index({ branch: 1 });
+GroupSchema.index({ name: 1 });
+
+CBSLocationSchema.index({ branch: 1 });
+
+QRSessionSchema.index({ token: 1 });
+QRSessionSchema.index({ branch: 1, createdAt: -1 });
+QRSessionSchema.index({ group: 1, type: 1, date: -1 });
+QRSessionSchema.index({ "scans.group": 1 });
+
+AssignmentSchema.index({ group: 1 });
+AssignmentSchema.index({ branch: 1 });
+AssignmentSchema.index({ assignedTo: 1 });
+AssignmentSchema.index({ member: 1 });
+
+ReportSchema.index({ targetGroup: 1, createdAt: -1 });
+ReportSchema.index({ targetBranch: 1, createdAt: -1 });
+ReportSchema.index({ scope: 1, createdAt: -1 });
+
+NotificationSchema.index({ type: 1, targetGroup: 1, createdAt: -1 });
+NotificationSchema.index({ targetBranch: 1, createdAt: -1 });
+NotificationSchema.index({ targetUser: 1, createdAt: -1 });
+NotificationSchema.index({ sentBy: 1 });
+
+ActivityLogSchema.index({ branch: 1, createdAt: -1 });
+ActivityLogSchema.index({ createdAt: -1 });
+
+StatusUpdateSchema.index({ group: 1, quarter: 1 });
+StatusUpdateSchema.index({ branch: 1, quarter: 1 });
+StatusUpdateSchema.index({ memberId: 1, quarter: 1 });
+StatusUpdateSchema.index({ status: 1, quarter: 1 });
+
 // Create Models
 const User = mongoose.model("User", UserSchema);
 const Member = mongoose.model("Member", MemberSchema);
@@ -582,7 +642,8 @@ const authMiddleware = async (req, res, next) => {
     const token = req.header("Authorization")?.replace("Bearer ", "");
     if (!token) return res.status(401).json({ error: "Please authenticate" });
     const decoded = jwt.verify(token, process.env.JWT_SECRET);
-    const user = await User.findById(decoded.userId).select("-password");
+    // lean() returns a plain object — ~3x faster than a full Mongoose document
+    const user = await User.findById(decoded.userId).select("-password").lean();
     if (!user) return res.status(401).json({ error: "User not found" });
     req.user = user;
     next();
@@ -639,7 +700,11 @@ app.use(
 // ========== DATABASE CONNECTION ==========
 console.log("🔌 Connecting to MongoDB Atlas...");
 mongoose
-  .connect(process.env.MONGODB_URI)
+  .connect(process.env.MONGODB_URI, {
+    maxPoolSize: 10, // allow up to 10 concurrent DB connections
+    serverSelectionTimeoutMS: 5000,
+    socketTimeoutMS: 45000,
+  })
   .then(() => {
     console.log("✅ Connected to MongoDB Atlas!");
     initializeDatabase();
@@ -651,16 +716,15 @@ mongoose
 
 // ========== HELPERS ==========
 async function logActivity(action, user, details = "") {
-  try {
-    await ActivityLog.create({
-      action,
-      user: user?._id,
-      userName: user?.fullName || "System",
-      userRole: user?.role || "System",
-      branch: user?.branch || null,
-      details,
-    });
-  } catch (e) {}
+  // Fire-and-forget: never await this in a request handler — it must not slow responses
+  ActivityLog.create({
+    action,
+    user: user?._id,
+    userName: user?.fullName || "System",
+    userRole: user?.role || "System",
+    branch: user?.branch || null,
+    details,
+  }).catch(() => {});
 }
 
 async function sendSystemNotification(
@@ -1078,21 +1142,23 @@ app.get("/api/members", authMiddleware, async (req, res) => {
         { fullName: { $regex: search, $options: "i" } },
         { phoneNumber: { $regex: search, $options: "i" } },
       ];
-    const members = await Member.find(query).sort({ createdAt: -1 });
+    const members = await Member.find(query).sort({ createdAt: -1 }).lean();
     const phoneNumbers = members.map((m) => m.phoneNumber);
     const users = await User.find(
-      { phoneNumber: { $in: phoneNumbers } },
+      {
+        phoneNumber: { $in: phoneNumbers },
+        profilePhoto: { $exists: true, $ne: "" },
+      },
       { phoneNumber: 1, profilePhoto: 1 },
-    );
+    ).lean();
     const userPhotoMap = {};
     users.forEach((u) => {
       if (u.profilePhoto) userPhotoMap[u.phoneNumber] = u.profilePhoto;
     });
     const enriched = members.map((m) => {
-      const obj = m.toObject();
-      if (!obj.profilePhoto && userPhotoMap[m.phoneNumber])
-        obj.profilePhoto = userPhotoMap[m.phoneNumber];
-      return obj;
+      if (!m.profilePhoto && userPhotoMap[m.phoneNumber])
+        m.profilePhoto = userPhotoMap[m.phoneNumber];
+      return m;
     });
     res.json(enriched);
   } catch (error) {
@@ -1553,8 +1619,28 @@ app.post(
       const leaderGroup = req.user.group;
       const leaderBranch = req.user.branch || "MOR Head Quarter";
 
+      // ── PRE-LOAD: collect all phones from the parsed rows first,
+      //    then do ONE bulk lookup instead of 2 queries per row.
+      const allPhonesRaw = parsedRows
+        .map((r) => {
+          let p = (r.phone || "").replace(/\s+/g, "");
+          if (/^\d+$/.test(p) && p.length > 0 && p[0] !== "0") p = "0" + p;
+          return p;
+        })
+        .filter(Boolean);
+
+      const [existingUserPhones, existingMemberPhones] = await Promise.all([
+        User.distinct("phoneNumber", { phoneNumber: { $in: allPhonesRaw } }),
+        Member.distinct("phoneNumber", { phoneNumber: { $in: allPhonesRaw } }),
+      ]);
+      const existingPhoneSet = new Set([
+        ...existingUserPhones,
+        ...existingMemberPhones,
+      ]);
+
       let successCount = 0;
       const skippedDetails = [];
+      const groupCountInc = {}; // tracks how many members to add per group (batched)
 
       for (const row of parsedRows) {
         const fullName = row.fullName;
@@ -1583,7 +1669,6 @@ app.post(
         }
 
         // Clean phone: strip spaces, then restore leading zero Excel may have stripped.
-        // e.g. "33230039" (8 digits, no leading 0) → "033230039"
         let cleanPhone = phone.replace(/\s+/g, "");
         if (
           /^\d+$/.test(cleanPhone) &&
@@ -1593,12 +1678,8 @@ app.post(
           cleanPhone = "0" + cleanPhone;
         }
 
-        // Skip if phone already registered in User or Member
-        const existingUser = await User.findOne({ phoneNumber: cleanPhone });
-        const existingMember = await Member.findOne({
-          phoneNumber: cleanPhone,
-        });
-        if (existingUser || existingMember) {
+        // Skip if phone already registered — use the pre-loaded set (no per-row DB query)
+        if (existingPhoneSet.has(cleanPhone)) {
           skippedDetails.push({
             phone: cleanPhone,
             name: fullName,
@@ -1644,16 +1725,23 @@ app.post(
         });
         await newMember.save();
 
-        // Increment group member count
+        // Track per-group count for batch update after loop
         if (assignedGroup) {
-          await Group.findOneAndUpdate(
-            { name: assignedGroup },
-            { $inc: { memberCount: 1 } },
-          );
+          groupCountInc[assignedGroup] =
+            (groupCountInc[assignedGroup] || 0) + 1;
         }
+        // Mark phone as used so within-batch duplicates are also caught
+        existingPhoneSet.add(cleanPhone);
 
         successCount++;
       }
+
+      // Batch group member count updates — one write per group, not per member
+      await Promise.all(
+        Object.entries(groupCountInc).map(([name, inc]) =>
+          Group.findOneAndUpdate({ name }, { $inc: { memberCount: inc } }),
+        ),
+      );
 
       // Log the import
       await BulkImport.create({
@@ -1836,10 +1924,13 @@ app.post(
 // GET /api/attendance-years — returns distinct years that have attendance records
 app.get("/api/attendance-years", authMiddleware, async (req, res) => {
   try {
-    const records = await Attendance.find({}, { date: 1 }).lean();
-    const years = [
-      ...new Set(records.map((r) => new Date(r.date).getFullYear())),
-    ].sort((a, b) => b - a); // newest first
+    // Use aggregation to extract years without loading full documents
+    const result = await Attendance.aggregate([
+      { $project: { year: { $year: "$date" } } },
+      { $group: { _id: "$year" } },
+      { $sort: { _id: -1 } },
+    ]);
+    const years = result.map((r) => r._id);
     res.json(years);
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -2051,16 +2142,41 @@ app.get("/api/dashboard/stats", authMiddleware, async (req, res) => {
       ]);
 
     const groupPerformance = [];
-    for (const group of groups) {
-      const gm = await Member.find({ group: group.name });
-      groupPerformance.push({
-        name: group.name,
-        memberCount: gm.length,
-        stewardCount: gm.filter((m) => m.isSteward).length,
-        intenseLeaderCount: gm.filter(
-          (m) => m.membershipStatus === "Intense Leader",
-        ).length,
+    if (groups.length > 0) {
+      // Single aggregation instead of N Member.find() calls in a loop
+      const groupNames = groups.map((g) => g.name);
+      const memberAgg = await Member.aggregate([
+        { $match: { group: { $in: groupNames } } },
+        {
+          $group: {
+            _id: "$group",
+            memberCount: { $sum: 1 },
+            stewardCount: { $sum: { $cond: ["$isSteward", 1, 0] } },
+            intenseLeaderCount: {
+              $sum: {
+                $cond: [{ $eq: ["$membershipStatus", "Intense Leader"] }, 1, 0],
+              },
+            },
+          },
+        },
+      ]);
+      const memberAggMap = {};
+      memberAgg.forEach((r) => {
+        memberAggMap[r._id] = r;
       });
+      for (const group of groups) {
+        const agg = memberAggMap[group.name] || {
+          memberCount: 0,
+          stewardCount: 0,
+          intenseLeaderCount: 0,
+        };
+        groupPerformance.push({
+          name: group.name,
+          memberCount: agg.memberCount,
+          stewardCount: agg.stewardCount,
+          intenseLeaderCount: agg.intenseLeaderCount,
+        });
+      }
     }
 
     res.json({
@@ -2092,17 +2208,20 @@ app.get("/api/groups", optionalAuth, async (req, res) => {
   try {
     const query = {};
     if (req.query.branch) {
-      // Explicit branch param takes priority (used by signup and index.html filters)
       query.branch = req.query.branch;
     } else if (req.user && req.user.role === "Branch Head Shepherd") {
-      // Authenticated Branch Head Shepherd with no explicit param — scope to their branch
       query.branch = req.user.branch;
     }
-    const groups = await Group.find(query);
+    const groups = await Group.find(query).lean();
     const memberQuery = query.branch ? { branch: query.branch } : {};
-    const members = await Member.find(memberQuery);
+    // Only fetch fields needed for counting — avoid loading all member data
+    const members = await Member.find(memberQuery, {
+      group: 1,
+      isSteward: 1,
+      membershipStatus: 1,
+    }).lean();
     const groupsWithCounts = groups.map((group) => ({
-      ...group.toObject(),
+      ...group,
       memberCount: members.filter((m) => m.group === group.name).length,
       stewardCount: members.filter((m) => m.group === group.name && m.isSteward)
         .length,
@@ -3636,16 +3755,18 @@ async function runQuarterlyStatusUpdate(quarterDate) {
           );
         }
 
-        // Notify head shepherds
-        for (const hs of headShepherds) {
-          await sendSystemNotification(
-            leaderTitle,
-            leaderMsg,
-            "report",
-            null,
-            hs._id,
-          );
-        }
+        // Notify head shepherds in parallel
+        await Promise.all(
+          headShepherds.map((hs) =>
+            sendSystemNotification(
+              leaderTitle,
+              leaderMsg,
+              "report",
+              null,
+              hs._id,
+            ),
+          ),
+        );
 
         await logActivity(
           `STATUS_${direction.toUpperCase()}${result.pending ? "_PENDING" : "_AUTO"}`,
@@ -3909,19 +4030,22 @@ app.patch(
             memberUser._id,
           );
         }
-        // Notify head shepherds
-        const headShepherds = await User.find({
-          role: { $in: ["Head Shepherd", "Branch Head Shepherd"] },
-        });
-        for (const hs of headShepherds) {
-          await sendSystemNotification(
-            `✅ Status Approved — ${record.memberName}`,
-            `${req.user.fullName} approved the status change for ${record.memberName} (${record.group}): "${record.fromStatus}" → "${record.toStatus}" (${record.quarter}).`,
-            "report",
-            null,
-            hs._id,
-          );
-        }
+        // Notify head shepherds in parallel
+        const headShepherds = await User.find(
+          { role: { $in: ["Head Shepherd", "Branch Head Shepherd"] } },
+          { _id: 1 },
+        ).lean();
+        await Promise.all(
+          headShepherds.map((hs) =>
+            sendSystemNotification(
+              `✅ Status Approved — ${record.memberName}`,
+              `${req.user.fullName} approved the status change for ${record.memberName} (${record.group}): "${record.fromStatus}" → "${record.toStatus}" (${record.quarter}).`,
+              "report",
+              null,
+              hs._id,
+            ),
+          ),
+        );
       } else {
         // Notify member of rejection
         const memberUser = await User.findOne({
