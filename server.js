@@ -100,6 +100,19 @@ const UserSchema = new mongoose.Schema({
     default: null,
   },
   assignedToName: { type: String, default: null },
+  // ── Signup approval workflow ──
+  // "approved" is the default so accounts created directly by a leader
+  // (via /api/auth/register-member) or the bootstrap Head Shepherd account
+  // get instant access. Only public self-signup (/api/auth/register) sets
+  // this to "pending".
+  approvalStatus: {
+    type: String,
+    enum: ["pending", "approved", "rejected"],
+    default: "approved",
+  },
+  approvedBy: { type: mongoose.Schema.Types.ObjectId, ref: "User", default: null },
+  approvedByName: { type: String, default: null },
+  approvedAt: { type: Date, default: null },
   createdAt: { type: Date, default: Date.now },
   lastLogin: Date,
 });
@@ -976,30 +989,79 @@ app.post(
 
 app.post("/api/auth/register", async (req, res) => {
   try {
-    const { fullName, phoneNumber, password, group, branch, ...otherFields } =
-      req.body;
+    const {
+      fullName,
+      phoneNumber,
+      password,
+      group,
+      branch,
+      membershipStatus,
+      ...otherFields
+    } = req.body;
+    if (!fullName || !phoneNumber || !password)
+      return res
+        .status(400)
+        .json({ error: "fullName, phoneNumber and password are required" });
     if (await User.findOne({ phoneNumber }))
       return res.status(400).json({ error: "Phone number already registered" });
+
     const userCount = await User.countDocuments();
-    let role = "Member";
-    if (userCount === 0) role = "Head Shepherd";
+    const isFirstUser = userCount === 0;
+
+    // The very first account in the system bootstraps as the Head Shepherd
+    // and is auto-approved. Every other public signup starts as a Member
+    // pending approval.
+    const status = MEMBERSHIP_STATUSES.includes(membershipStatus)
+      ? membershipStatus
+      : "First Timer";
+    const userBranch = branch || "MOR Head Quarter";
+
+    if (!isFirstUser && !group) {
+      return res.status(400).json({ error: "Please select a Ministry Group" });
+    }
+
     const hashedPassword = await bcrypt.hash(password, 10);
+    const role = isFirstUser ? "Head Shepherd" : "Member";
+
     const user = new User({
       fullName,
       phoneNumber,
       password: hashedPassword,
       role,
-      branch: branch || "MOR Head Quarter",
+      branch: userBranch,
       group: group || null,
+      membershipStatus: status,
+      approvalStatus: isFirstUser ? "approved" : "pending",
       ...otherFields,
     });
     await user.save();
+
+    if (!isFirstUser) {
+      // Pending signup: no Member directory record and no login token yet —
+      // those are created once a Group Head Leader / Branch Shepherd /
+      // Head Shepherd approves the account.
+      await logActivity(
+        `submitted a signup pending approval (${status})`,
+        user,
+      );
+      const approverLabel =
+        status === "Leader"
+          ? "the Head Shepherd (or your Branch Shepherd)"
+          : "your Group Head Leader";
+      return res.status(201).json({
+        message: `Thank you for signing up! Your account is pending approval. Please wait for ${approverLabel} to approve your registration before you can log in.`,
+        pending: true,
+        approverLabel,
+      });
+    }
+
+    // First-ever user (bootstrap Head Shepherd) — instant access, same as before.
     const member = new Member({
       fullName,
       phoneNumber,
-      branch: branch || "MOR Head Quarter",
+      branch: userBranch,
       group: group || null,
-      membershipStatus: "First Timer",
+      membershipStatus: status,
       ...otherFields,
       addedBy: user._id,
       addedByName: user.fullName,
@@ -1026,7 +1088,7 @@ app.post("/api/auth/register", async (req, res) => {
       },
     });
   } catch (error) {
-    res.status(500).json({ error: "Server error" });
+    res.status(500).json({ error: error.message || "Server error" });
   }
 });
 
@@ -1037,6 +1099,23 @@ app.post("/api/auth/login", async (req, res) => {
     if (!user) return res.status(401).json({ error: "Invalid credentials" });
     if (!(await bcrypt.compare(password, user.password)))
       return res.status(401).json({ error: "Invalid credentials" });
+    if (user.approvalStatus === "pending") {
+      const approverLabel =
+        user.membershipStatus === "Leader"
+          ? "the Head Shepherd (or your Branch Shepherd)"
+          : "your Group Head Leader";
+      return res.status(403).json({
+        error: `Your account is pending approval. Please wait for ${approverLabel} to approve your registration before logging in.`,
+        pending: true,
+      });
+    }
+    if (user.approvalStatus === "rejected") {
+      return res.status(403).json({
+        error:
+          "Your registration was not approved. Please contact your Group Head Leader or the Head Shepherd for more information.",
+        rejected: true,
+      });
+    }
     const token = jwt.sign(
       { userId: user._id, role: user.role },
       process.env.JWT_SECRET,
@@ -1079,6 +1158,187 @@ app.get("/api/auth/verify", authMiddleware, async (req, res) => {
     },
   });
 });
+
+// ========== PENDING APPROVAL ROUTES ==========
+// Order used to sort/group pending signups on screen: Leader first, then
+// Intense Leader down to First Timer.
+const APPROVAL_STATUS_ORDER = [
+  "Leader",
+  "Intense Leader",
+  "Consistent",
+  "Semi-Consistent",
+  "Inconsistent",
+  "First Timer",
+];
+
+// Builds the Mongo query that scopes which pending signups a given
+// approver may see/act on:
+//  • Head Shepherd     → "Leader" signups from ANY branch
+//  • Branch Head Shepherd → "Leader" signups from THEIR branch only
+//  • Group Leader      → every other status, for THEIR group only
+function pendingApprovalScopeQuery(user) {
+  if (user.role === "Head Shepherd") {
+    return { approvalStatus: "pending", membershipStatus: "Leader" };
+  }
+  if (user.role === "Branch Head Shepherd") {
+    return {
+      approvalStatus: "pending",
+      membershipStatus: "Leader",
+      branch: user.branch,
+    };
+  }
+  if (user.role === "Group Leader") {
+    return {
+      approvalStatus: "pending",
+      membershipStatus: { $ne: "Leader" },
+      group: user.group,
+    };
+  }
+  return null;
+}
+
+// Confirms the requesting user actually has authority to approve/reject
+// this specific pending account (defence-in-depth beyond the list scope).
+function canDecideApproval(approver, target) {
+  if (target.membershipStatus === "Leader") {
+    return (
+      approver.role === "Head Shepherd" ||
+      (approver.role === "Branch Head Shepherd" &&
+        approver.branch === target.branch)
+    );
+  }
+  return approver.role === "Group Leader" && approver.group === target.group;
+}
+
+app.get(
+  "/api/pending-approvals",
+  authMiddleware,
+  roleMiddleware("Head Shepherd", "Branch Head Shepherd", "Group Leader"),
+  async (req, res) => {
+    try {
+      const query = pendingApprovalScopeQuery(req.user);
+      if (!query) return res.status(403).json({ error: "Access denied" });
+      const pending = await User.find(query)
+        .select("-password")
+        .sort({ createdAt: 1 })
+        .lean();
+      pending.sort((a, b) => {
+        const ia = APPROVAL_STATUS_ORDER.indexOf(a.membershipStatus);
+        const ib = APPROVAL_STATUS_ORDER.indexOf(b.membershipStatus);
+        return (ia < 0 ? 99 : ia) - (ib < 0 ? 99 : ib);
+      });
+      res.json(pending);
+    } catch (error) {
+      res.status(500).json({ error: error.message || "Server error" });
+    }
+  },
+);
+
+app.post(
+  "/api/pending-approvals/:id/approve",
+  authMiddleware,
+  roleMiddleware("Head Shepherd", "Branch Head Shepherd", "Group Leader"),
+  async (req, res) => {
+    try {
+      const target = await User.findById(req.params.id);
+      if (!target) return res.status(404).json({ error: "User not found" });
+      if (target.approvalStatus !== "pending")
+        return res
+          .status(400)
+          .json({ error: "This account is not pending approval" });
+      if (!canDecideApproval(req.user, target))
+        return res.status(403).json({
+          error:
+            target.membershipStatus === "Leader"
+              ? "Only the Head Shepherd or this branch's Branch Shepherd can approve a Leader signup"
+              : "Only this group's Group Head Leader can approve this signup",
+        });
+
+      target.approvalStatus = "approved";
+      target.approvedBy = req.user._id;
+      target.approvedByName = req.user.fullName;
+      target.approvedAt = new Date();
+      await target.save();
+
+      // Now that they're approved, create their Member directory record
+      // (so they show up in member lists / attendance / stats) and backfill
+      // absences the same way admin-added members get.
+      let member = await Member.findOne({ phoneNumber: target.phoneNumber });
+      if (!member) {
+        member = new Member({
+          fullName: target.fullName,
+          phoneNumber: target.phoneNumber,
+          branch: target.branch,
+          group: target.group,
+          membershipStatus: target.membershipStatus,
+          dateOfBirth: target.dateOfBirth,
+          gender: target.gender,
+          address: target.address,
+          occupation: target.occupation,
+          school: target.school,
+          church: target.church,
+          cbsLocation: target.cbsLocation,
+          profilePhoto: target.profilePhoto,
+          addedBy: req.user._id,
+          addedByName: req.user.fullName,
+        });
+        await member.save();
+        backfillAbsentForNewMember(member);
+      }
+      if (member.group)
+        await Group.findOneAndUpdate(
+          { name: member.group },
+          { $inc: { memberCount: 1 } },
+        );
+
+      await sendSystemNotification(
+        "✅ Account Approved",
+        `Welcome ${target.fullName}! Your MOR account has been approved — you can now log in.`,
+        "general",
+        null,
+        target._id,
+      );
+      await logActivity(`approved the signup of ${target.fullName}`, req.user);
+
+      res.json({ message: `${target.fullName} has been approved`, user: target });
+    } catch (error) {
+      res.status(500).json({ error: error.message || "Server error" });
+    }
+  },
+);
+
+app.post(
+  "/api/pending-approvals/:id/reject",
+  authMiddleware,
+  roleMiddleware("Head Shepherd", "Branch Head Shepherd", "Group Leader"),
+  async (req, res) => {
+    try {
+      const target = await User.findById(req.params.id);
+      if (!target) return res.status(404).json({ error: "User not found" });
+      if (target.approvalStatus !== "pending")
+        return res
+          .status(400)
+          .json({ error: "This account is not pending approval" });
+      if (!canDecideApproval(req.user, target))
+        return res.status(403).json({
+          error:
+            target.membershipStatus === "Leader"
+              ? "Only the Head Shepherd or this branch's Branch Shepherd can reject a Leader signup"
+              : "Only this group's Group Head Leader can reject this signup",
+        });
+
+      const fullName = target.fullName;
+      // Remove the account entirely so the phone number is free for them to
+      // sign up again if this was a mistake.
+      await User.findByIdAndDelete(target._id);
+      await logActivity(`rejected the signup of ${fullName}`, req.user);
+
+      res.json({ message: `${fullName}'s signup has been rejected` });
+    } catch (error) {
+      res.status(500).json({ error: error.message || "Server error" });
+    }
+  },
+);
 
 // ========== PROFILE ROUTES ==========
 app.post(
