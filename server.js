@@ -10,6 +10,7 @@ const fs = require("fs");
 const cloudinary = require("cloudinary").v2;
 const crypto = require("crypto");
 const cron = require("node-cron");
+const webpush = require("web-push");
 
 // ========== CLOUDINARY CONFIGURATION ==========
 cloudinary.config({
@@ -21,6 +22,14 @@ cloudinary.config({
 const compression = require("compression");
 
 const app = express();
+
+// These environment values identify MOR to the browser's push provider.
+const VAPID_PUBLIC_KEY = process.env.VAPID_PUBLIC_KEY;
+if (VAPID_PUBLIC_KEY && process.env.VAPID_PRIVATE_KEY && process.env.VAPID_SUBJECT) {
+  webpush.setVapidDetails(process.env.VAPID_SUBJECT, VAPID_PUBLIC_KEY, process.env.VAPID_PRIVATE_KEY);
+} else {
+  console.warn("Push notifications are disabled until VAPID credentials are configured.");
+}
 
 // ========== MIDDLEWARE ==========
 // Gzip/brotli compress all responses — reduces payload size 60-80% for JSON
@@ -384,6 +393,17 @@ const NotificationSchema = new mongoose.Schema({
   createdAt: { type: Date, default: Date.now },
 });
 
+const PushSubscriptionSchema = new mongoose.Schema({
+  user: { type: mongoose.Schema.Types.ObjectId, ref: "User", required: true, index: true },
+  endpoint: { type: String, required: true, unique: true },
+  keys: {
+    p256dh: { type: String, required: true },
+    auth: { type: String, required: true },
+  },
+  createdAt: { type: Date, default: Date.now },
+  updatedAt: { type: Date, default: Date.now },
+});
+
 // Activity Log Model
 const ActivityLogSchema = new mongoose.Schema({
   action: { type: String, required: true },
@@ -481,6 +501,7 @@ const Assignment = mongoose.model("Assignment", AssignmentSchema);
 const Report = mongoose.model("Report", ReportSchema);
 const NotifSchedule = mongoose.model("NotifSchedule", NotifScheduleSchema);
 const Notification = mongoose.model("Notification", NotificationSchema);
+const PushSubscription = mongoose.model("PushSubscription", PushSubscriptionSchema);
 const ActivityLog = mongoose.model("ActivityLog", ActivityLogSchema);
 const Media = mongoose.model("Media", MediaSchema);
 // FollowUp Chat Model
@@ -827,6 +848,37 @@ async function backfillAbsentForNewMember(member) {
   }
 }
 
+function notificationIsForUser(notification, user) {
+  const userId = user._id.toString();
+  if (["Head Shepherd", "System Admin"].includes(user.role)) return true;
+  if (notification.type === "personal") return notification.targetUser?.toString() === userId;
+  if (user.role === "Member") return ["general", "reminder"].includes(notification.type) || (notification.type === "group" && notification.targetGroup === user.group);
+  if (user.role === "Group Leader") return ["general", "reminder", "report"].includes(notification.type) || (notification.type === "group" && notification.targetGroup === user.group);
+  if (user.role === "Branch Head Shepherd") return notification.targetBranch === user.branch || (notification.type === "group" && notification.targetGroup === user.group) || (notification.type === "reminder" && !notification.targetBranch);
+  return false;
+}
+
+async function sendPushForNotification(notification) {
+  if (!VAPID_PUBLIC_KEY || !process.env.VAPID_PRIVATE_KEY || !process.env.VAPID_SUBJECT) return;
+  try {
+    const users = await User.find({ approvalStatus: { $ne: "pending" } }).select("role group branch").lean();
+    const recipients = users.filter((user) => notificationIsForUser(notification, user));
+    const subscriptions = await PushSubscription.find({ user: { $in: recipients.map((user) => user._id) } }).lean();
+    await Promise.all(subscriptions.map(async (subscription) => {
+      const recipient = recipients.find((user) => user._id.toString() === subscription.user.toString());
+      const unread = await Notification.find({ readBy: { $ne: recipient._id } }).sort({ createdAt: -1 }).limit(50).lean();
+      const badgeCount = unread.filter((item) => notificationIsForUser(item, recipient)).length;
+      const notificationPage = recipient.role === "Group Leader" ? "/group-leader.html" : recipient.role === "Branch Head Shepherd" ? "/branch.html" : "/member.html";
+      try {
+        await webpush.sendNotification({ endpoint: subscription.endpoint, keys: subscription.keys }, JSON.stringify({ title: notification.title, body: notification.message, tag: `mor-${notification._id}`, url: `${notificationPage}#notifications`, badgeCount }), { TTL: 86400 });
+      } catch (error) {
+        if (error.statusCode === 404 || error.statusCode === 410) await PushSubscription.deleteOne({ _id: subscription._id });
+        else console.error("Web Push delivery error:", error.message);
+      }
+    }));
+  } catch (error) { console.error("Web Push dispatch error:", error.message); }
+}
+
 async function sendSystemNotification(
   title,
   message,
@@ -835,7 +887,7 @@ async function sendSystemNotification(
   targetUser = null,
 ) {
   try {
-    await Notification.create({
+    const notification = await Notification.create({
       title,
       message,
       type,
@@ -844,6 +896,7 @@ async function sendSystemNotification(
       sentByName: "MOR System",
       sentByRole: "System",
     });
+    await sendPushForNotification(notification);
   } catch (e) {}
 }
 
@@ -3469,6 +3522,25 @@ app.delete(
 );
 
 // ========== NOTIFICATIONS ==========
+app.get("/api/push/public-key", authMiddleware, (req, res) => {
+  if (!VAPID_PUBLIC_KEY) return res.status(503).json({ error: "Device notifications have not been configured yet" });
+  res.json({ publicKey: VAPID_PUBLIC_KEY });
+});
+
+app.post("/api/push/subscribe", authMiddleware, async (req, res) => {
+  try {
+    const subscription = req.body;
+    if (!subscription?.endpoint || !subscription?.keys?.p256dh || !subscription?.keys?.auth)
+      return res.status(400).json({ error: "Invalid device notification subscription" });
+    await PushSubscription.findOneAndUpdate(
+      { endpoint: subscription.endpoint },
+      { $set: { user: req.user._id, endpoint: subscription.endpoint, keys: subscription.keys, updatedAt: new Date() } },
+      { upsert: true, new: true, setDefaultsOnInsert: true },
+    );
+    res.status(201).json({ message: "This device is ready for notifications" });
+  } catch (error) { res.status(500).json({ error: "Could not save this device" }); }
+});
+
 app.get("/api/notifications", authMiddleware, async (req, res) => {
   try {
     let query = {};
@@ -3519,6 +3591,18 @@ app.get("/api/notifications", authMiddleware, async (req, res) => {
     res.status(500).json({ error: "Server error" });
   }
 });
+
+// Opening the app clears the device's notification count, but never deletes
+// notifications; they remain visible in the Notifications page.
+app.post("/api/notifications/read-all", authMiddleware, async (req, res) => {
+  try {
+    const unread = await Notification.find({ readBy: { $ne: req.user._id } }).select("_id type targetGroup targetBranch targetUser").lean();
+    const ids = unread.filter((notification) => notificationIsForUser(notification, req.user)).map((notification) => notification._id);
+    if (ids.length) await Notification.updateMany({ _id: { $in: ids } }, { $addToSet: { readBy: req.user._id } });
+    res.json({ message: "Notification counter cleared", count: ids.length });
+  } catch (error) { res.status(500).json({ error: "Could not clear notification counter" }); }
+});
+
 app.post("/api/notifications", authMiddleware, async (req, res) => {
   try {
     if (req.user.role === "Member") {
@@ -3534,6 +3618,7 @@ app.post("/api/notifications", authMiddleware, async (req, res) => {
       sentByRole: req.user.role,
     });
     await notification.save();
+    await sendPushForNotification(notification);
     res.status(201).json(notification);
   } catch (error) {
     res.status(500).json({ error: "Server error" });
