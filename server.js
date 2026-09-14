@@ -25,10 +25,20 @@ const app = express();
 
 // These environment values identify MOR to the browser's push provider.
 const VAPID_PUBLIC_KEY = process.env.VAPID_PUBLIC_KEY;
-if (VAPID_PUBLIC_KEY && process.env.VAPID_PRIVATE_KEY && process.env.VAPID_SUBJECT) {
-  webpush.setVapidDetails(process.env.VAPID_SUBJECT, VAPID_PUBLIC_KEY, process.env.VAPID_PRIVATE_KEY);
+if (
+  VAPID_PUBLIC_KEY &&
+  process.env.VAPID_PRIVATE_KEY &&
+  process.env.VAPID_SUBJECT
+) {
+  webpush.setVapidDetails(
+    process.env.VAPID_SUBJECT,
+    VAPID_PUBLIC_KEY,
+    process.env.VAPID_PRIVATE_KEY,
+  );
 } else {
-  console.warn("Push notifications are disabled until VAPID credentials are configured.");
+  console.warn(
+    "Push notifications are disabled until VAPID credentials are configured.",
+  );
 }
 
 // ========== MIDDLEWARE ==========
@@ -41,8 +51,8 @@ app.use(
       "http://127.0.0.1:5500",
       "http://localhost:5500",
       "http://localhost:5000",
-      "https://mor-system-app.vercel.app",
-      "https://mor-system-grhjve1h3-ss-conteh.vercel.app",
+      "https://mor-fellowship.vercel.app",
+      "https://mor-fellowship-2xtf0hdti-ss-conteh.vercel.app",
       "http://localhost",
       "capacitor://localhost",
     ],
@@ -99,7 +109,11 @@ const UserSchema = new mongoose.Schema({
     enum: ["pending", "approved", "rejected"],
     default: "pending",
   },
-  approvedBy: { type: mongoose.Schema.Types.ObjectId, ref: "User", default: null },
+  approvedBy: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: "User",
+    default: null,
+  },
   approvedAt: { type: Date, default: null },
   isSteward: { type: Boolean, default: false },
   stewardSince: Date,
@@ -145,7 +159,11 @@ const MemberSchema = new mongoose.Schema({
     enum: ["pending", "approved", "rejected"],
     default: "pending",
   },
-  approvedBy: { type: mongoose.Schema.Types.ObjectId, ref: "User", default: null },
+  approvedBy: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: "User",
+    default: null,
+  },
   approvedAt: { type: Date, default: null },
   // ── FIX #3: Added role field to Member model ──
   role: {
@@ -400,7 +418,12 @@ const NotificationSchema = new mongoose.Schema({
 });
 
 const PushSubscriptionSchema = new mongoose.Schema({
-  user: { type: mongoose.Schema.Types.ObjectId, ref: "User", required: true, index: true },
+  user: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: "User",
+    required: true,
+    index: true,
+  },
   endpoint: { type: String, required: true, unique: true },
   keys: {
     p256dh: { type: String, required: true },
@@ -507,7 +530,10 @@ const Assignment = mongoose.model("Assignment", AssignmentSchema);
 const Report = mongoose.model("Report", ReportSchema);
 const NotifSchedule = mongoose.model("NotifSchedule", NotifScheduleSchema);
 const Notification = mongoose.model("Notification", NotificationSchema);
-const PushSubscription = mongoose.model("PushSubscription", PushSubscriptionSchema);
+const PushSubscription = mongoose.model(
+  "PushSubscription",
+  PushSubscriptionSchema,
+);
 const ActivityLog = mongoose.model("ActivityLog", ActivityLogSchema);
 const Media = mongoose.model("Media", MediaSchema);
 // FollowUp Chat Model
@@ -719,16 +745,36 @@ function detectImageType(buffer) {
   if (!buffer || buffer.length < 4) return null;
   const b = buffer;
   if (b[0] === 0xff && b[1] === 0xd8 && b[2] === 0xff) return "jpeg";
-  if (b.length >= 8 && b[0] === 0x89 && b[1] === 0x50 && b[2] === 0x4e && b[3] === 0x47 && b[4] === 0x0d && b[5] === 0x0a && b[6] === 0x1a && b[7] === 0x0a) return "png";
-  if (b[0] === 0x47 && b[1] === 0x49 && b[2] === 0x46 && b[3] === 0x38) return "gif";
+  if (
+    b.length >= 8 &&
+    b[0] === 0x89 &&
+    b[1] === 0x50 &&
+    b[2] === 0x4e &&
+    b[3] === 0x47 &&
+    b[4] === 0x0d &&
+    b[5] === 0x0a &&
+    b[6] === 0x1a &&
+    b[7] === 0x0a
+  )
+    return "png";
+  if (b[0] === 0x47 && b[1] === 0x49 && b[2] === 0x46 && b[3] === 0x38)
+    return "gif";
   if (b[0] === 0x42 && b[1] === 0x4d) return "bmp";
-  if (b[0] === 0x49 && b[1] === 0x49 && b[2] === 0x2a && b[3] === 0x00) return "tiff";
-  if (b[0] === 0x4d && b[1] === 0x4d && b[2] === 0x00 && b[3] === 0x2a) return "tiff";
-  if (b.length >= 12 && b.toString("ascii", 0, 4) === "RIFF" && b.toString("ascii", 8, 12) === "WEBP") return "webp";
+  if (b[0] === 0x49 && b[1] === 0x49 && b[2] === 0x2a && b[3] === 0x00)
+    return "tiff";
+  if (b[0] === 0x4d && b[1] === 0x4d && b[2] === 0x00 && b[3] === 0x2a)
+    return "tiff";
+  if (
+    b.length >= 12 &&
+    b.toString("ascii", 0, 4) === "RIFF" &&
+    b.toString("ascii", 8, 12) === "WEBP"
+  )
+    return "webp";
   // HEIC/HEIF/AVIF are ISO-BMFF files. The brand is stored at byte 8.
   if (b.length >= 12 && b.toString("ascii", 4, 8) === "ftyp") {
     const brand = b.toString("ascii", 8, 12).toLowerCase();
-    if (["heic", "heix", "hevc", "hevx", "mif1", "msf1"].includes(brand)) return "heic";
+    if (["heic", "heix", "hevc", "hevx", "mif1", "msf1"].includes(brand))
+      return "heic";
     if (["avif", "avis"].includes(brand)) return "avif";
   }
   return null;
@@ -883,45 +929,102 @@ async function backfillAbsentForNewMember(member) {
 function notificationIsForUser(notification, user) {
   const userId = user._id.toString();
   // A deleted notification is hidden only from the account that deleted it.
-  if ((notification.deletedBy || []).some((id) => id?.toString() === userId)) return false;
+  if ((notification.deletedBy || []).some((id) => id?.toString() === userId))
+    return false;
   // Personal notifications always belong only to their intended recipient.
   // This includes account-approval notices and pending-approval requests.
-  if (notification.type === "personal") return notification.targetUser?.toString() === userId;
+  if (notification.type === "personal")
+    return notification.targetUser?.toString() === userId;
   // Scheduled reminders are delivered to members only, and are scoped by the
   // reminder's target group/branch. This prevents one leader's reminders from
   // leaking into other groups or branches.
   if (notification.type === "reminder") {
     if (user.role !== "Member") return false;
-    if (notification.targetGroup) return notification.targetGroup === user.group;
-    if (notification.targetBranch) return notification.targetBranch === user.branch;
+    if (notification.targetGroup)
+      return notification.targetGroup === user.group;
+    if (notification.targetBranch)
+      return notification.targetBranch === user.branch;
     return true;
   }
   if (["Head Shepherd", "System Admin"].includes(user.role)) return true;
-  if (user.role === "Member") return ["general"].includes(notification.type) || (notification.type === "group" && notification.targetGroup === user.group);
-  if (user.role === "Group Leader") return ["general", "report"].includes(notification.type) || (notification.type === "group" && notification.targetGroup === user.group);
-  if (user.role === "Branch Head Shepherd") return notification.targetBranch === user.branch || (notification.type === "group" && notification.targetGroup === user.group);
+  if (user.role === "Member")
+    return (
+      ["general"].includes(notification.type) ||
+      (notification.type === "group" && notification.targetGroup === user.group)
+    );
+  if (user.role === "Group Leader")
+    return (
+      ["general", "report"].includes(notification.type) ||
+      (notification.type === "group" && notification.targetGroup === user.group)
+    );
+  if (user.role === "Branch Head Shepherd")
+    return (
+      notification.targetBranch === user.branch ||
+      (notification.type === "group" && notification.targetGroup === user.group)
+    );
   return false;
 }
 
 async function sendPushForNotification(notification) {
-  if (!VAPID_PUBLIC_KEY || !process.env.VAPID_PRIVATE_KEY || !process.env.VAPID_SUBJECT) return;
+  if (
+    !VAPID_PUBLIC_KEY ||
+    !process.env.VAPID_PRIVATE_KEY ||
+    !process.env.VAPID_SUBJECT
+  )
+    return;
   try {
-    const users = await User.find({ approvalStatus: { $ne: "pending" } }).select("role group branch").lean();
-    const recipients = users.filter((user) => notificationIsForUser(notification, user));
-    const subscriptions = await PushSubscription.find({ user: { $in: recipients.map((user) => user._id) } }).lean();
-    await Promise.all(subscriptions.map(async (subscription) => {
-      const recipient = recipients.find((user) => user._id.toString() === subscription.user.toString());
-      const unread = await Notification.find({ readBy: { $ne: recipient._id }, deletedBy: { $ne: recipient._id } }).sort({ createdAt: -1 }).limit(50).lean();
-      const badgeCount = unread.filter((item) => notificationIsForUser(item, recipient)).length;
-      const notificationPage = recipient.role === "Group Leader" ? "/group-leader.html" : recipient.role === "Branch Head Shepherd" ? "/branch.html" : "/member.html";
-      try {
-        await webpush.sendNotification({ endpoint: subscription.endpoint, keys: subscription.keys }, JSON.stringify({ title: notification.title, body: notification.message, tag: `mor-${notification._id}`, url: `${notificationPage}#notifications`, badgeCount }), { TTL: 86400 });
-      } catch (error) {
-        if (error.statusCode === 404 || error.statusCode === 410) await PushSubscription.deleteOne({ _id: subscription._id });
-        else console.error("Web Push delivery error:", error.message);
-      }
-    }));
-  } catch (error) { console.error("Web Push dispatch error:", error.message); }
+    const users = await User.find({ approvalStatus: { $ne: "pending" } })
+      .select("role group branch")
+      .lean();
+    const recipients = users.filter((user) =>
+      notificationIsForUser(notification, user),
+    );
+    const subscriptions = await PushSubscription.find({
+      user: { $in: recipients.map((user) => user._id) },
+    }).lean();
+    await Promise.all(
+      subscriptions.map(async (subscription) => {
+        const recipient = recipients.find(
+          (user) => user._id.toString() === subscription.user.toString(),
+        );
+        const unread = await Notification.find({
+          readBy: { $ne: recipient._id },
+          deletedBy: { $ne: recipient._id },
+        })
+          .sort({ createdAt: -1 })
+          .limit(50)
+          .lean();
+        const badgeCount = unread.filter((item) =>
+          notificationIsForUser(item, recipient),
+        ).length;
+        const notificationPage =
+          recipient.role === "Group Leader"
+            ? "/group-leader.html"
+            : recipient.role === "Branch Head Shepherd"
+              ? "/branch.html"
+              : "/member.html";
+        try {
+          await webpush.sendNotification(
+            { endpoint: subscription.endpoint, keys: subscription.keys },
+            JSON.stringify({
+              title: notification.title,
+              body: notification.message,
+              tag: `mor-${notification._id}`,
+              url: `${notificationPage}#notifications`,
+              badgeCount,
+            }),
+            { TTL: 86400 },
+          );
+        } catch (error) {
+          if (error.statusCode === 404 || error.statusCode === 410)
+            await PushSubscription.deleteOne({ _id: subscription._id });
+          else console.error("Web Push delivery error:", error.message);
+        }
+      }),
+    );
+  } catch (error) {
+    console.error("Web Push dispatch error:", error.message);
+  }
 }
 
 async function sendSystemNotification(
@@ -1094,15 +1197,29 @@ app.post(
 
 app.post("/api/auth/register", async (req, res) => {
   try {
-    const { fullName, phoneNumber, password, group, branch, membershipStatus, ...otherFields } = req.body;
+    const {
+      fullName,
+      phoneNumber,
+      password,
+      group,
+      branch,
+      membershipStatus,
+      ...otherFields
+    } = req.body;
     if (!fullName || !phoneNumber || !password || !group || !branch)
-      return res.status(400).json({ error: "Name, phone number, password, branch and ministry group are required" });
+      return res.status(400).json({
+        error:
+          "Name, phone number, password, branch and ministry group are required",
+      });
     // The public form calls this level "Intense"; retain the existing
     // internal value so attendance reports and historical records continue
     // to work without a data migration.
-    const selectedStatus = membershipStatus === "Intense" ? "Intense Leader" : membershipStatus;
+    const selectedStatus =
+      membershipStatus === "Intense" ? "Intense Leader" : membershipStatus;
     if (!MEMBERSHIP_STATUSES.includes(selectedStatus))
-      return res.status(400).json({ error: "Please select a valid membership status" });
+      return res
+        .status(400)
+        .json({ error: "Please select a valid membership status" });
     if (await User.findOne({ phoneNumber }))
       return res.status(400).json({ error: "Phone number already registered" });
     const hashedPassword = await bcrypt.hash(password, 10);
@@ -1134,22 +1251,53 @@ app.post("/api/auth/register", async (req, res) => {
 
     // Create a persistent notification for the Group Leader and also inform the Head Shepherd.
     // The Group Leader's notification appears in their Notifications navigation as well as push.
-    const groupApprovers = selectedStatus === "Leader"
-      ? []
-      : await User.find({ role: "Group Leader", branch, group, approvalStatus: { $ne: "pending" } }).select("_id");
-    const headShepherds = await User.find({ role: "Head Shepherd", approvalStatus: { $ne: "pending" } }).select("_id");
-    const displayStatus = selectedStatus === "Intense Leader" ? "Intense" : selectedStatus;
-    const groupTitle = selectedStatus === "Leader" ? "⏳ Leader Approval Required" : "⏳ Member Approval Required";
+    const groupApprovers =
+      selectedStatus === "Leader"
+        ? []
+        : await User.find({
+            role: "Group Leader",
+            branch,
+            group,
+            approvalStatus: { $ne: "pending" },
+          }).select("_id");
+    const headShepherds = await User.find({
+      role: "Head Shepherd",
+      approvalStatus: { $ne: "pending" },
+    }).select("_id");
+    const displayStatus =
+      selectedStatus === "Intense Leader" ? "Intense" : selectedStatus;
+    const groupTitle =
+      selectedStatus === "Leader"
+        ? "⏳ Leader Approval Required"
+        : "⏳ Member Approval Required";
     const groupMessage = `${fullName} has signed up as ${displayStatus} in ${group} Group (${branch}) and is waiting for your approval.`;
-    const headMessage = selectedStatus === "Leader"
-      ? `${fullName} has signed up as ${displayStatus} in ${group} Group (${branch}) and is waiting for your approval.`
-      : `${fullName} has signed up as ${displayStatus} in ${group} Group (${branch}) and is waiting for the group leader's approval.`;
+    const headMessage =
+      selectedStatus === "Leader"
+        ? `${fullName} has signed up as ${displayStatus} in ${group} Group (${branch}) and is waiting for your approval.`
+        : `${fullName} has signed up as ${displayStatus} in ${group} Group (${branch}) and is waiting for the group leader's approval.`;
     await Promise.all([
-      ...groupApprovers.map((approver) => sendSystemNotification(groupTitle, groupMessage, "personal", null, approver._id)),
-      ...headShepherds.map((approver) => sendSystemNotification("⏳ New Member Signup", headMessage, "personal", null, approver._id)),
+      ...groupApprovers.map((approver) =>
+        sendSystemNotification(
+          groupTitle,
+          groupMessage,
+          "personal",
+          null,
+          approver._id,
+        ),
+      ),
+      ...headShepherds.map((approver) =>
+        sendSystemNotification(
+          "⏳ New Member Signup",
+          headMessage,
+          "personal",
+          null,
+          approver._id,
+        ),
+      ),
     ]);
     res.status(201).json({
-      message: "Your account is pending approval. Please wait for your shepherd to approve it before signing in.",
+      message:
+        "Your account is pending approval. Please wait for your shepherd to approve it before signing in.",
       pendingApproval: true,
     });
   } catch (error) {
@@ -1166,9 +1314,10 @@ app.post("/api/auth/login", async (req, res) => {
       return res.status(401).json({ error: "Invalid credentials" });
     if (user.approvalStatus && user.approvalStatus !== "approved")
       return res.status(403).json({
-        error: user.approvalStatus === "rejected"
-          ? "Your account registration was not approved. Please contact your shepherd."
-          : "Your account is pending approval. Please wait for your shepherd before signing in.",
+        error:
+          user.approvalStatus === "rejected"
+            ? "Your account registration was not approved. Please contact your shepherd."
+            : "Your account is pending approval. Please wait for your shepherd before signing in.",
         pendingApproval: user.approvalStatus === "pending",
       });
     const isFirstLogin = !user.lastLogin;
@@ -1212,25 +1361,43 @@ function mayApproveMember(approver, applicant) {
   if (approver.role === "Head Shepherd" || approver.role === "System Admin")
     return applicant.membershipStatus === "Leader";
   if (approver.role === "Branch Head Shepherd")
-    return applicant.membershipStatus === "Leader" && approver.branch === applicant.branch;
+    return (
+      applicant.membershipStatus === "Leader" &&
+      approver.branch === applicant.branch
+    );
   if (approver.role === "Group Leader")
-    return applicant.membershipStatus !== "Leader" && approver.branch === applicant.branch && approver.group === applicant.group;
+    return (
+      applicant.membershipStatus !== "Leader" &&
+      approver.branch === applicant.branch &&
+      approver.group === applicant.group
+    );
   return false;
 }
 
 app.get(
   "/api/approvals/pending",
   authMiddleware,
-  roleMiddleware("Head Shepherd", "Branch Head Shepherd", "Group Leader", "System Admin"),
+  roleMiddleware(
+    "Head Shepherd",
+    "Branch Head Shepherd",
+    "Group Leader",
+    "System Admin",
+  ),
   async (req, res) => {
     try {
       const candidates = await User.find({ approvalStatus: "pending" })
-        .select("fullName phoneNumber branch group membershipStatus createdAt profilePhoto")
+        .select(
+          "fullName phoneNumber branch group membershipStatus createdAt profilePhoto",
+        )
         .lean();
-      const members = candidates.filter((candidate) => mayApproveMember(req.user, candidate));
+      const members = candidates.filter((candidate) =>
+        mayApproveMember(req.user, candidate),
+      );
       res.json({ count: members.length, members });
     } catch (error) {
-      res.status(500).json({ error: error.message || "Could not load pending approvals" });
+      res
+        .status(500)
+        .json({ error: error.message || "Could not load pending approvals" });
     }
   },
 );
@@ -1238,14 +1405,21 @@ app.get(
 app.post(
   "/api/approvals/:userId/approve",
   authMiddleware,
-  roleMiddleware("Head Shepherd", "Branch Head Shepherd", "Group Leader", "System Admin"),
+  roleMiddleware(
+    "Head Shepherd",
+    "Branch Head Shepherd",
+    "Group Leader",
+    "System Admin",
+  ),
   async (req, res) => {
     try {
       const applicant = await User.findById(req.params.userId);
       if (!applicant || applicant.approvalStatus !== "pending")
         return res.status(404).json({ error: "Pending applicant not found" });
       if (!mayApproveMember(req.user, applicant))
-        return res.status(403).json({ error: "You are not allowed to approve this member" });
+        return res
+          .status(403)
+          .json({ error: "You are not allowed to approve this member" });
 
       const approvedAt = new Date();
       applicant.approvalStatus = "approved";
@@ -1254,7 +1428,13 @@ app.post(
       await applicant.save();
       await Member.updateOne(
         { phoneNumber: applicant.phoneNumber },
-        { $set: { approvalStatus: "approved", approvedBy: req.user._id, approvedAt } },
+        {
+          $set: {
+            approvalStatus: "approved",
+            approvedBy: req.user._id,
+            approvedAt,
+          },
+        },
       );
       await sendSystemNotification(
         "✅ Account Approved",
@@ -1269,20 +1449,35 @@ app.post(
         role: "Head Shepherd",
         approvalStatus: { $ne: "pending" },
       }).select("_id");
-      const pronoun = String(applicant.gender || "").toLowerCase().startsWith("m") ? "He" : String(applicant.gender || "").toLowerCase().startsWith("f") ? "She" : "They";
-      await Promise.all(headShepherds.map((shepherd) =>
-        sendSystemNotification(
-          "✅ Member Account Approved",
-          `${applicant.fullName} MOR account has been approved by ${req.user.fullName}. ${pronoun} can now sign in and access the system.`,
-          "personal",
-          null,
-          shepherd._id,
+      const pronoun = String(applicant.gender || "")
+        .toLowerCase()
+        .startsWith("m")
+        ? "He"
+        : String(applicant.gender || "")
+              .toLowerCase()
+              .startsWith("f")
+          ? "She"
+          : "They";
+      await Promise.all(
+        headShepherds.map((shepherd) =>
+          sendSystemNotification(
+            "✅ Member Account Approved",
+            `${applicant.fullName} MOR account has been approved by ${req.user.fullName}. ${pronoun} can now sign in and access the system.`,
+            "personal",
+            null,
+            shepherd._id,
+          ),
         ),
-      ));
-      await logActivity(`approved ${applicant.fullName}'s membership`, req.user);
+      );
+      await logActivity(
+        `approved ${applicant.fullName}'s membership`,
+        req.user,
+      );
       res.json({ message: `${applicant.fullName} has been approved` });
     } catch (error) {
-      res.status(500).json({ error: error.message || "Could not approve member" });
+      res
+        .status(500)
+        .json({ error: error.message || "Could not approve member" });
     }
   },
 );
@@ -1303,7 +1498,9 @@ app.get("/api/auth/verify", authMiddleware, async (req, res) => {
 async function uploadProfilePhotoToCloudinary(file) {
   if (!file) throw new Error("No image was uploaded");
   if (!isAllowedProfileImage(file)) {
-    const err = new Error("Please upload a valid image (JPEG, PNG, GIF, WebP, HEIC/HEIF, AVIF, BMP or TIFF).");
+    const err = new Error(
+      "Please upload a valid image (JPEG, PNG, GIF, WebP, HEIC/HEIF, AVIF, BMP or TIFF).",
+    );
     err.statusCode = 400;
     throw err;
   }
@@ -1337,7 +1534,9 @@ app.post(
       res.json({ photoUrl, message: "Image uploaded successfully" });
     } catch (error) {
       console.error("Profile image upload error:", error);
-      res.status(error.statusCode || 500).json({ error: error.message || "Image upload failed" });
+      res
+        .status(error.statusCode || 500)
+        .json({ error: error.message || "Image upload failed" });
     }
   },
 );
@@ -1357,7 +1556,9 @@ app.post(
       res.json({ photoUrl, message: "Profile photo updated successfully" });
     } catch (error) {
       console.error("Profile photo update error:", error);
-      res.status(error.statusCode || 500).json({ error: error.message || "Profile photo update failed" });
+      res
+        .status(error.statusCode || 500)
+        .json({ error: error.message || "Profile photo update failed" });
     }
   },
 );
@@ -3555,8 +3756,20 @@ app.put("/api/reports/:id/read", authMiddleware, async (req, res) => {
 
 // ========== NOTIFICATION SCHEDULES / REMINDERS ==========
 function normalizeReminderData(body, user) {
-  const days = Array.isArray(body.daysOfWeek) ? body.daysOfWeek.map(Number).filter((d) => Number.isInteger(d) && d >= 0 && d <= 6) : [];
-  const times = Array.isArray(body.times) ? [...new Set(body.times.map(String).filter((t) => /^([01]\d|2[0-3]):[0-5]\d$/.test(t)))].sort() : [];
+  const days = Array.isArray(body.daysOfWeek)
+    ? body.daysOfWeek
+        .map(Number)
+        .filter((d) => Number.isInteger(d) && d >= 0 && d <= 6)
+    : [];
+  const times = Array.isArray(body.times)
+    ? [
+        ...new Set(
+          body.times
+            .map(String)
+            .filter((t) => /^([01]\d|2[0-3]):[0-5]\d$/.test(t)),
+        ),
+      ].sort()
+    : [];
   const data = {
     title: String(body.title || "").trim(),
     message: String(body.message || "").trim(),
@@ -3577,77 +3790,162 @@ function normalizeReminderData(body, user) {
     data.targetBranch = user.branch || undefined;
     data.targetGroup = undefined;
   }
-  if (!data.title || !data.message || !data.daysOfWeek.length || !data.times.length) {
-    throw Object.assign(new Error("Title, message, at least one day, and at least one time are required"), { statusCode: 400 });
+  if (
+    !data.title ||
+    !data.message ||
+    !data.daysOfWeek.length ||
+    !data.times.length
+  ) {
+    throw Object.assign(
+      new Error(
+        "Title, message, at least one day, and at least one time are required",
+      ),
+      { statusCode: 400 },
+    );
   }
-  if (data.times.length > 12) throw Object.assign(new Error("You can set up to 12 reminder times per day"), { statusCode: 400 });
+  if (data.times.length > 12)
+    throw Object.assign(
+      new Error("You can set up to 12 reminder times per day"),
+      { statusCode: 400 },
+    );
   return data;
 }
 
 function reminderInUserScope(reminder, user) {
   if (["Head Shepherd", "System Admin"].includes(user.role)) return true;
-  if (user.role === "Branch Head Shepherd") return reminder.targetBranch === user.branch || reminder.createdBy?.toString() === user._id.toString();
-  if (user.role === "Group Leader") return reminder.targetGroup === user.group || reminder.createdBy?.toString() === user._id.toString();
+  if (user.role === "Branch Head Shepherd")
+    return (
+      reminder.targetBranch === user.branch ||
+      reminder.createdBy?.toString() === user._id.toString()
+    );
+  if (user.role === "Group Leader")
+    return (
+      reminder.targetGroup === user.group ||
+      reminder.createdBy?.toString() === user._id.toString()
+    );
   return false;
 }
 
 app.get("/api/notification-schedules", authMiddleware, async (req, res) => {
   try {
     let query = {};
-    if (req.user.role === "Branch Head Shepherd") query = { $or: [{ targetBranch: req.user.branch }, { createdBy: req.user._id }] };
-    else if (req.user.role === "Group Leader") query = { $or: [{ targetGroup: req.user.group }, { createdBy: req.user._id }] };
-    else if (!["Head Shepherd", "System Admin"].includes(req.user.role)) return res.status(403).json({ error: "Access denied" });
+    if (req.user.role === "Branch Head Shepherd")
+      query = {
+        $or: [{ targetBranch: req.user.branch }, { createdBy: req.user._id }],
+      };
+    else if (req.user.role === "Group Leader")
+      query = {
+        $or: [{ targetGroup: req.user.group }, { createdBy: req.user._id }],
+      };
+    else if (!["Head Shepherd", "System Admin"].includes(req.user.role))
+      return res.status(403).json({ error: "Access denied" });
     res.json(await NotifSchedule.find(query).sort({ createdAt: -1 }).lean());
-  } catch (error) { res.status(500).json({ error: "Server error" }); }
+  } catch (error) {
+    res.status(500).json({ error: "Server error" });
+  }
 });
 
-app.post("/api/notification-schedules", authMiddleware, roleMiddleware("Head Shepherd", "Branch Head Shepherd", "Group Leader"), async (req, res) => {
-  try {
-    const schedData = normalizeReminderData(req.body, req.user);
-    const s = await NotifSchedule.create({ ...schedData, createdBy: req.user._id });
-    res.status(201).json(s);
-  } catch (error) { res.status(error.statusCode || 500).json({ error: error.message || "Server error" }); }
-});
+app.post(
+  "/api/notification-schedules",
+  authMiddleware,
+  roleMiddleware("Head Shepherd", "Branch Head Shepherd", "Group Leader"),
+  async (req, res) => {
+    try {
+      const schedData = normalizeReminderData(req.body, req.user);
+      const s = await NotifSchedule.create({
+        ...schedData,
+        createdBy: req.user._id,
+      });
+      res.status(201).json(s);
+    } catch (error) {
+      res
+        .status(error.statusCode || 500)
+        .json({ error: error.message || "Server error" });
+    }
+  },
+);
 
-app.put("/api/notification-schedules/:id", authMiddleware, roleMiddleware("Head Shepherd", "Branch Head Shepherd", "Group Leader"), async (req, res) => {
-  try {
-    const s = await NotifSchedule.findById(req.params.id);
-    if (!s) return res.status(404).json({ error: "Reminder not found" });
-    if (!reminderInUserScope(s, req.user)) return res.status(403).json({ error: "Access denied" });
-    const data = normalizeReminderData({ ...s.toObject(), ...req.body }, req.user);
-    const updated = await NotifSchedule.findByIdAndUpdate(s._id, data, { new: true, runValidators: true });
-    res.json(updated);
-  } catch (error) { res.status(error.statusCode || 500).json({ error: error.message || "Server error" }); }
-});
+app.put(
+  "/api/notification-schedules/:id",
+  authMiddleware,
+  roleMiddleware("Head Shepherd", "Branch Head Shepherd", "Group Leader"),
+  async (req, res) => {
+    try {
+      const s = await NotifSchedule.findById(req.params.id);
+      if (!s) return res.status(404).json({ error: "Reminder not found" });
+      if (!reminderInUserScope(s, req.user))
+        return res.status(403).json({ error: "Access denied" });
+      const data = normalizeReminderData(
+        { ...s.toObject(), ...req.body },
+        req.user,
+      );
+      const updated = await NotifSchedule.findByIdAndUpdate(s._id, data, {
+        new: true,
+        runValidators: true,
+      });
+      res.json(updated);
+    } catch (error) {
+      res
+        .status(error.statusCode || 500)
+        .json({ error: error.message || "Server error" });
+    }
+  },
+);
 
-app.delete("/api/notification-schedules/:id", authMiddleware, roleMiddleware("Head Shepherd", "Branch Head Shepherd", "Group Leader"), async (req, res) => {
-  try {
-    const s = await NotifSchedule.findById(req.params.id);
-    if (!s) return res.status(404).json({ error: "Reminder not found" });
-    if (!reminderInUserScope(s, req.user)) return res.status(403).json({ error: "Access denied" });
-    await NotifSchedule.findByIdAndDelete(s._id);
-    res.json({ message: "Reminder deleted" });
-  } catch (error) { res.status(500).json({ error: "Server error" }); }
-});
+app.delete(
+  "/api/notification-schedules/:id",
+  authMiddleware,
+  roleMiddleware("Head Shepherd", "Branch Head Shepherd", "Group Leader"),
+  async (req, res) => {
+    try {
+      const s = await NotifSchedule.findById(req.params.id);
+      if (!s) return res.status(404).json({ error: "Reminder not found" });
+      if (!reminderInUserScope(s, req.user))
+        return res.status(403).json({ error: "Access denied" });
+      await NotifSchedule.findByIdAndDelete(s._id);
+      res.json({ message: "Reminder deleted" });
+    } catch (error) {
+      res.status(500).json({ error: "Server error" });
+    }
+  },
+);
 
 // ========== NOTIFICATIONS ==========
 app.get("/api/push/public-key", authMiddleware, (req, res) => {
-  if (!VAPID_PUBLIC_KEY) return res.status(503).json({ error: "Device notifications have not been configured yet" });
+  if (!VAPID_PUBLIC_KEY)
+    return res
+      .status(503)
+      .json({ error: "Device notifications have not been configured yet" });
   res.json({ publicKey: VAPID_PUBLIC_KEY });
 });
 
 app.post("/api/push/subscribe", authMiddleware, async (req, res) => {
   try {
     const subscription = req.body;
-    if (!subscription?.endpoint || !subscription?.keys?.p256dh || !subscription?.keys?.auth)
-      return res.status(400).json({ error: "Invalid device notification subscription" });
+    if (
+      !subscription?.endpoint ||
+      !subscription?.keys?.p256dh ||
+      !subscription?.keys?.auth
+    )
+      return res
+        .status(400)
+        .json({ error: "Invalid device notification subscription" });
     await PushSubscription.findOneAndUpdate(
       { endpoint: subscription.endpoint },
-      { $set: { user: req.user._id, endpoint: subscription.endpoint, keys: subscription.keys, updatedAt: new Date() } },
+      {
+        $set: {
+          user: req.user._id,
+          endpoint: subscription.endpoint,
+          keys: subscription.keys,
+          updatedAt: new Date(),
+        },
+      },
       { upsert: true, new: true, setDefaultsOnInsert: true },
     );
     res.status(201).json({ message: "This device is ready for notifications" });
-  } catch (error) { res.status(500).json({ error: "Could not save this device" }); }
+  } catch (error) {
+    res.status(500).json({ error: "Could not save this device" });
+  }
 });
 
 app.get("/api/notifications", authMiddleware, async (req, res) => {
@@ -3659,7 +3957,11 @@ app.get("/api/notifications", authMiddleware, async (req, res) => {
           { type: "general" },
           { type: "reminder", targetGroup: req.user.group },
           { type: "reminder", targetBranch: req.user.branch },
-          { type: "reminder", targetGroup: { $exists: false }, targetBranch: { $exists: false } },
+          {
+            type: "reminder",
+            targetGroup: { $exists: false },
+            targetBranch: { $exists: false },
+          },
           { type: "group", targetGroup: req.user.group },
           { type: "personal", targetUser: req.user._id },
         ],
@@ -3707,36 +4009,51 @@ app.get("/api/notifications", authMiddleware, async (req, res) => {
 // notifications; they remain visible in the Notifications page.
 app.post("/api/notifications/read-all", authMiddleware, async (req, res) => {
   try {
-    const unread = await Notification.find({ readBy: { $ne: req.user._id } }).select("_id type targetGroup targetBranch targetUser").lean();
-    const ids = unread.filter((notification) => notificationIsForUser(notification, req.user)).map((notification) => notification._id);
-    if (ids.length) await Notification.updateMany({ _id: { $in: ids } }, { $addToSet: { readBy: req.user._id } });
+    const unread = await Notification.find({ readBy: { $ne: req.user._id } })
+      .select("_id type targetGroup targetBranch targetUser")
+      .lean();
+    const ids = unread
+      .filter((notification) => notificationIsForUser(notification, req.user))
+      .map((notification) => notification._id);
+    if (ids.length)
+      await Notification.updateMany(
+        { _id: { $in: ids } },
+        { $addToSet: { readBy: req.user._id } },
+      );
     res.json({ message: "Notification counter cleared", count: ids.length });
-  } catch (error) { res.status(500).json({ error: "Could not clear notification counter" }); }
-});
-
-app.post("/api/notifications", authMiddleware, roleMiddleware("Head Shepherd", "Branch Head Shepherd", "Group Leader"), async (req, res) => {
-  try {
-    // Only Head Shepherds, Branch Head Shepherds, and Group Leaders may
-    // manually send notifications. Members cannot send notifications.
-    if (req.user.role === "Group Leader") {
-      req.body.type = "group";
-      req.body.targetGroup = req.user.group;
-    }
-    // Tag notification with sender's branch so recipients can filter
-    if (req.user.branch) req.body.targetBranch = req.user.branch;
-    const notification = new Notification({
-      ...req.body,
-      sentBy: req.user._id,
-      sentByName: req.user.fullName,
-      sentByRole: req.user.role,
-    });
-    await notification.save();
-    await sendPushForNotification(notification);
-    res.status(201).json(notification);
   } catch (error) {
-    res.status(500).json({ error: "Server error" });
+    res.status(500).json({ error: "Could not clear notification counter" });
   }
 });
+
+app.post(
+  "/api/notifications",
+  authMiddleware,
+  roleMiddleware("Head Shepherd", "Branch Head Shepherd", "Group Leader"),
+  async (req, res) => {
+    try {
+      // Only Head Shepherds, Branch Head Shepherds, and Group Leaders may
+      // manually send notifications. Members cannot send notifications.
+      if (req.user.role === "Group Leader") {
+        req.body.type = "group";
+        req.body.targetGroup = req.user.group;
+      }
+      // Tag notification with sender's branch so recipients can filter
+      if (req.user.branch) req.body.targetBranch = req.user.branch;
+      const notification = new Notification({
+        ...req.body,
+        sentBy: req.user._id,
+        sentByName: req.user.fullName,
+        sentByRole: req.user.role,
+      });
+      await notification.save();
+      await sendPushForNotification(notification);
+      res.status(201).json(notification);
+    } catch (error) {
+      res.status(500).json({ error: "Server error" });
+    }
+  },
+);
 app.post("/api/notifications/:id/read", authMiddleware, async (req, res) => {
   try {
     const n = await Notification.findById(req.params.id);
@@ -4695,12 +5012,18 @@ cron.schedule("* * * * *", async () => {
     const hhmm = `${String(now.getUTCHours()).padStart(2, "0")}:${String(now.getUTCMinutes()).padStart(2, "0")}`;
     const schedules = await NotifSchedule.find({ isActive: true }).lean();
     for (const sched of schedules) {
-      const days = Array.isArray(sched.daysOfWeek) && sched.daysOfWeek.length
-        ? sched.daysOfWeek
-        : (sched.schedule?.dayOfWeek !== undefined ? [sched.schedule.dayOfWeek] : []);
-      const times = Array.isArray(sched.times) && sched.times.length
-        ? sched.times
-        : (sched.schedule?.hourUTC !== undefined ? [`${String(sched.schedule.hourUTC).padStart(2, "0")}:00`] : []);
+      const days =
+        Array.isArray(sched.daysOfWeek) && sched.daysOfWeek.length
+          ? sched.daysOfWeek
+          : sched.schedule?.dayOfWeek !== undefined
+            ? [sched.schedule.dayOfWeek]
+            : [];
+      const times =
+        Array.isArray(sched.times) && sched.times.length
+          ? sched.times
+          : sched.schedule?.hourUTC !== undefined
+            ? [`${String(sched.schedule.hourUTC).padStart(2, "0")}:00`]
+            : [];
       if (!days.includes(day) || !times.includes(hhmm)) continue;
       const sendKey = `${now.toISOString().slice(0, 10)}-${hhmm}`;
       // Avoid duplicate sends if a hosting platform briefly runs overlapping workers.
@@ -4709,17 +5032,24 @@ cron.schedule("* * * * *", async () => {
         title: sched.title,
         message: sched.message,
         type: "reminder",
-        targetGroup: sched.targetScope === "group" ? sched.targetGroup : undefined,
-        targetBranch: sched.targetScope === "branch" ? sched.targetBranch : undefined,
+        targetGroup:
+          sched.targetScope === "group" ? sched.targetGroup : undefined,
+        targetBranch:
+          sched.targetScope === "branch" ? sched.targetBranch : undefined,
         sentBy: sched.createdBy,
         sentByName: "MOR Reminder",
         sentByRole: "System",
       });
       await sendPushForNotification(notification);
-      await NotifSchedule.findByIdAndUpdate(sched._id, { lastSent: now, lastSentKey: sendKey });
+      await NotifSchedule.findByIdAndUpdate(sched._id, {
+        lastSent: now,
+        lastSentKey: sendKey,
+      });
       console.log(`✅ Sent reminder: ${sched.title} at ${hhmm}`);
     }
-  } catch (e) { console.error("Cron reminder error:", e.message); }
+  } catch (e) {
+    console.error("Cron reminder error:", e.message);
+  }
 });
 
 // ========== DATABASE INITIALIZATION ==========
@@ -4763,7 +5093,8 @@ async function initializeDatabase() {
         message:
           "Fellowship is today at 1 PM! Join us for worship, the Word, and fellowship together. Be there and be a blessing!",
         activityType: "fellowship",
-        daysOfWeek: [6], times: ["09:00"],
+        daysOfWeek: [6],
+        times: ["09:00"],
         isActive: true,
       },
       {
@@ -4771,7 +5102,8 @@ async function initializeDatabase() {
         message:
           "CBS Bible Study is tonight! Come and grow in the Word of God. Let nothing keep you away from studying God's Word.",
         activityType: "cbs",
-        daysOfWeek: [2], times: ["14:00"],
+        daysOfWeek: [2],
+        times: ["14:00"],
         isActive: true,
       },
       {
@@ -4779,7 +5111,8 @@ async function initializeDatabase() {
         message:
           "Evangelism is today! Let us go out and share the Good News. Souls are waiting! Be part of this great commission.",
         activityType: "evangelism",
-        daysOfWeek: [5], times: ["14:00"],
+        daysOfWeek: [5],
+        times: ["14:00"],
         isActive: true,
       },
     ];
@@ -5335,14 +5668,17 @@ app.get(
 // which makes frontend response.json() fail with: Unexpected token '<'.
 app.use((err, req, res, next) => {
   if (err instanceof multer.MulterError) {
-    const message = err.code === "LIMIT_FILE_SIZE"
-      ? "Image is too large. Please choose an image smaller than 15 MB."
-      : err.message || "Image upload failed";
+    const message =
+      err.code === "LIMIT_FILE_SIZE"
+        ? "Image is too large. Please choose an image smaller than 15 MB."
+        : err.message || "Image upload failed";
     return res.status(400).json({ error: message });
   }
   if (err) {
     console.error("Unhandled request error:", err);
-    return res.status(err.statusCode || 500).json({ error: err.message || "Server error" });
+    return res
+      .status(err.statusCode || 500)
+      .json({ error: err.message || "Server error" });
   }
   next();
 });
