@@ -343,13 +343,17 @@ const ReportSchema = new mongoose.Schema({
 
 // Notification Schedule Model
 const NotifScheduleSchema = new mongoose.Schema({
-  title: { type: String, required: true },
-  message: { type: String, required: true },
+  title: { type: String, required: true, trim: true },
+  message: { type: String, required: true, trim: true },
   activityType: {
     type: String,
     enum: ["fellowship", "cbs", "evangelism", "seminar", "camp", "general"],
     default: "general",
   },
+  // New flexible weekly reminder schedule. Times are stored as HH:mm in UTC.
+  daysOfWeek: { type: [Number], default: [] },
+  times: { type: [String], default: [] },
+  // Kept for compatibility with older scheduled reminders.
   schedule: {
     dayOfWeek: Number,
     weekPattern: {
@@ -369,6 +373,7 @@ const NotifScheduleSchema = new mongoose.Schema({
   targetGroup: String,
   targetBranch: String,
   lastSent: Date,
+  lastSentKey: { type: String, default: "" },
   createdBy: { type: mongoose.Schema.Types.ObjectId, ref: "User" },
   createdAt: { type: Date, default: Date.now },
 });
@@ -882,10 +887,19 @@ function notificationIsForUser(notification, user) {
   // Personal notifications always belong only to their intended recipient.
   // This includes account-approval notices and pending-approval requests.
   if (notification.type === "personal") return notification.targetUser?.toString() === userId;
+  // Scheduled reminders are delivered to members only, and are scoped by the
+  // reminder's target group/branch. This prevents one leader's reminders from
+  // leaking into other groups or branches.
+  if (notification.type === "reminder") {
+    if (user.role !== "Member") return false;
+    if (notification.targetGroup) return notification.targetGroup === user.group;
+    if (notification.targetBranch) return notification.targetBranch === user.branch;
+    return true;
+  }
   if (["Head Shepherd", "System Admin"].includes(user.role)) return true;
-  if (user.role === "Member") return ["general", "reminder"].includes(notification.type) || (notification.type === "group" && notification.targetGroup === user.group);
-  if (user.role === "Group Leader") return ["general", "reminder", "report"].includes(notification.type) || (notification.type === "group" && notification.targetGroup === user.group);
-  if (user.role === "Branch Head Shepherd") return notification.targetBranch === user.branch || (notification.type === "group" && notification.targetGroup === user.group) || (notification.type === "reminder" && !notification.targetBranch);
+  if (user.role === "Member") return ["general"].includes(notification.type) || (notification.type === "group" && notification.targetGroup === user.group);
+  if (user.role === "Group Leader") return ["general", "report"].includes(notification.type) || (notification.type === "group" && notification.targetGroup === user.group);
+  if (user.role === "Branch Head Shepherd") return notification.targetBranch === user.branch || (notification.type === "group" && notification.targetGroup === user.group);
   return false;
 }
 
@@ -1157,6 +1171,7 @@ app.post("/api/auth/login", async (req, res) => {
           : "Your account is pending approval. Please wait for your shepherd before signing in.",
         pendingApproval: user.approvalStatus === "pending",
       });
+    const isFirstLogin = !user.lastLogin;
     const token = jwt.sign(
       { userId: user._id, role: user.role },
       process.env.JWT_SECRET,
@@ -1181,6 +1196,7 @@ app.post("/api/auth/login", async (req, res) => {
         isCBSLeader: user.isCBSLeader,
         assignedCBSLocation: user.assignedCBSLocation,
         isGroupLeader: user.isGroupLeader,
+        isFirstLogin,
       },
     });
   } catch (error) {
@@ -3537,88 +3553,82 @@ app.put("/api/reports/:id/read", authMiddleware, async (req, res) => {
   }
 });
 
-// ========== NOTIFICATION SCHEDULES ==========
+// ========== NOTIFICATION SCHEDULES / REMINDERS ==========
+function normalizeReminderData(body, user) {
+  const days = Array.isArray(body.daysOfWeek) ? body.daysOfWeek.map(Number).filter((d) => Number.isInteger(d) && d >= 0 && d <= 6) : [];
+  const times = Array.isArray(body.times) ? [...new Set(body.times.map(String).filter((t) => /^([01]\d|2[0-3]):[0-5]\d$/.test(t)))].sort() : [];
+  const data = {
+    title: String(body.title || "").trim(),
+    message: String(body.message || "").trim(),
+    activityType: body.activityType || "general",
+    daysOfWeek: [...new Set(days)].sort((a, b) => a - b),
+    times,
+    isActive: body.isActive !== false,
+    targetScope: body.targetScope || "all",
+    targetGroup: body.targetGroup || undefined,
+    targetBranch: body.targetBranch || undefined,
+  };
+  if (user.role === "Group Leader") {
+    data.targetScope = "group";
+    data.targetGroup = user.group || undefined;
+    data.targetBranch = user.branch || undefined;
+  } else if (user.role === "Branch Head Shepherd") {
+    data.targetScope = "branch";
+    data.targetBranch = user.branch || undefined;
+    data.targetGroup = undefined;
+  }
+  if (!data.title || !data.message || !data.daysOfWeek.length || !data.times.length) {
+    throw Object.assign(new Error("Title, message, at least one day, and at least one time are required"), { statusCode: 400 });
+  }
+  if (data.times.length > 12) throw Object.assign(new Error("You can set up to 12 reminder times per day"), { statusCode: 400 });
+  return data;
+}
+
+function reminderInUserScope(reminder, user) {
+  if (["Head Shepherd", "System Admin"].includes(user.role)) return true;
+  if (user.role === "Branch Head Shepherd") return reminder.targetBranch === user.branch || reminder.createdBy?.toString() === user._id.toString();
+  if (user.role === "Group Leader") return reminder.targetGroup === user.group || reminder.createdBy?.toString() === user._id.toString();
+  return false;
+}
+
 app.get("/api/notification-schedules", authMiddleware, async (req, res) => {
   try {
     let query = {};
-    if (req.user.role === "Branch Head Shepherd" && req.user.branch) {
-      // Branch shepherd sees only their own branch schedules
-      query = {
-        $or: [{ targetBranch: req.user.branch }, { createdBy: req.user._id }],
-      };
-    }
-    res.json(await NotifSchedule.find(query).sort({ createdAt: -1 }));
-  } catch (error) {
-    res.status(500).json({ error: "Server error" });
-  }
+    if (req.user.role === "Branch Head Shepherd") query = { $or: [{ targetBranch: req.user.branch }, { createdBy: req.user._id }] };
+    else if (req.user.role === "Group Leader") query = { $or: [{ targetGroup: req.user.group }, { createdBy: req.user._id }] };
+    else if (!["Head Shepherd", "System Admin"].includes(req.user.role)) return res.status(403).json({ error: "Access denied" });
+    res.json(await NotifSchedule.find(query).sort({ createdAt: -1 }).lean());
+  } catch (error) { res.status(500).json({ error: "Server error" }); }
 });
-app.post(
-  "/api/notification-schedules",
-  authMiddleware,
-  roleMiddleware("Head Shepherd", "Branch Head Shepherd", "System Admin"),
-  async (req, res) => {
-    try {
-      const schedData = { ...req.body, createdBy: req.user._id };
-      // Tag with branch for Branch Head Shepherd
-      if (req.user.role === "Branch Head Shepherd" && req.user.branch) {
-        schedData.targetBranch = req.user.branch;
-        schedData.targetScope = "branch";
-      }
-      const s = new NotifSchedule(schedData);
-      await s.save();
-      res.status(201).json(s);
-    } catch (error) {
-      res.status(500).json({ error: "Server error" });
-    }
-  },
-);
-app.put(
-  "/api/notification-schedules/:id",
-  authMiddleware,
-  roleMiddleware("Head Shepherd", "Branch Head Shepherd", "System Admin"),
-  async (req, res) => {
-    try {
-      const s = await NotifSchedule.findById(req.params.id);
-      if (!s) return res.status(404).json({ error: "Schedule not found" });
-      // Branch Head Shepherd can only update their own branch's schedules
-      if (
-        req.user.role === "Branch Head Shepherd" &&
-        s.targetBranch !== req.user.branch &&
-        s.createdBy?.toString() !== req.user._id.toString()
-      )
-        return res.status(403).json({ error: "Access denied" });
-      const updated = await NotifSchedule.findByIdAndUpdate(
-        req.params.id,
-        req.body,
-        { new: true },
-      );
-      res.json(updated);
-    } catch (error) {
-      res.status(500).json({ error: "Server error" });
-    }
-  },
-);
-app.delete(
-  "/api/notification-schedules/:id",
-  authMiddleware,
-  roleMiddleware("Head Shepherd", "Branch Head Shepherd", "System Admin"),
-  async (req, res) => {
-    try {
-      const s = await NotifSchedule.findById(req.params.id);
-      if (!s) return res.status(404).json({ error: "Schedule not found" });
-      if (
-        req.user.role === "Branch Head Shepherd" &&
-        s.targetBranch !== req.user.branch &&
-        s.createdBy?.toString() !== req.user._id.toString()
-      )
-        return res.status(403).json({ error: "Access denied" });
-      await NotifSchedule.findByIdAndDelete(req.params.id);
-      res.json({ message: "Schedule deleted" });
-    } catch (error) {
-      res.status(500).json({ error: "Server error" });
-    }
-  },
-);
+
+app.post("/api/notification-schedules", authMiddleware, roleMiddleware("Head Shepherd", "Branch Head Shepherd", "Group Leader"), async (req, res) => {
+  try {
+    const schedData = normalizeReminderData(req.body, req.user);
+    const s = await NotifSchedule.create({ ...schedData, createdBy: req.user._id });
+    res.status(201).json(s);
+  } catch (error) { res.status(error.statusCode || 500).json({ error: error.message || "Server error" }); }
+});
+
+app.put("/api/notification-schedules/:id", authMiddleware, roleMiddleware("Head Shepherd", "Branch Head Shepherd", "Group Leader"), async (req, res) => {
+  try {
+    const s = await NotifSchedule.findById(req.params.id);
+    if (!s) return res.status(404).json({ error: "Reminder not found" });
+    if (!reminderInUserScope(s, req.user)) return res.status(403).json({ error: "Access denied" });
+    const data = normalizeReminderData({ ...s.toObject(), ...req.body }, req.user);
+    const updated = await NotifSchedule.findByIdAndUpdate(s._id, data, { new: true, runValidators: true });
+    res.json(updated);
+  } catch (error) { res.status(error.statusCode || 500).json({ error: error.message || "Server error" }); }
+});
+
+app.delete("/api/notification-schedules/:id", authMiddleware, roleMiddleware("Head Shepherd", "Branch Head Shepherd", "Group Leader"), async (req, res) => {
+  try {
+    const s = await NotifSchedule.findById(req.params.id);
+    if (!s) return res.status(404).json({ error: "Reminder not found" });
+    if (!reminderInUserScope(s, req.user)) return res.status(403).json({ error: "Access denied" });
+    await NotifSchedule.findByIdAndDelete(s._id);
+    res.json({ message: "Reminder deleted" });
+  } catch (error) { res.status(500).json({ error: "Server error" }); }
+});
 
 // ========== NOTIFICATIONS ==========
 app.get("/api/push/public-key", authMiddleware, (req, res) => {
@@ -3647,7 +3657,9 @@ app.get("/api/notifications", authMiddleware, async (req, res) => {
       query = {
         $or: [
           { type: "general" },
-          { type: "reminder" },
+          { type: "reminder", targetGroup: req.user.group },
+          { type: "reminder", targetBranch: req.user.branch },
+          { type: "reminder", targetGroup: { $exists: false }, targetBranch: { $exists: false } },
           { type: "group", targetGroup: req.user.group },
           { type: "personal", targetUser: req.user._id },
         ],
@@ -3656,7 +3668,6 @@ app.get("/api/notifications", authMiddleware, async (req, res) => {
       query = {
         $or: [
           { type: "general" },
-          { type: "reminder" },
           { type: "group", targetGroup: req.user.group },
           { type: "personal", targetUser: req.user._id },
           { type: "report" },
@@ -3672,8 +3683,6 @@ app.get("/api/notifications", authMiddleware, async (req, res) => {
         $or: [
           { targetBranch: req.user.branch },
           { type: "group", targetGroup: { $in: groupNames } },
-          { type: "reminder", targetBranch: req.user.branch },
-          { type: "reminder", targetScope: "all" },
           { sentBy: req.user._id },
         ],
       };
@@ -3705,9 +3714,11 @@ app.post("/api/notifications/read-all", authMiddleware, async (req, res) => {
   } catch (error) { res.status(500).json({ error: "Could not clear notification counter" }); }
 });
 
-app.post("/api/notifications", authMiddleware, async (req, res) => {
+app.post("/api/notifications", authMiddleware, roleMiddleware("Head Shepherd", "Branch Head Shepherd", "Group Leader"), async (req, res) => {
   try {
-    if (req.user.role === "Member") {
+    // Only Head Shepherds, Branch Head Shepherds, and Group Leaders may
+    // manually send notifications. Members cannot send notifications.
+    if (req.user.role === "Group Leader") {
       req.body.type = "group";
       req.body.targetGroup = req.user.group;
     }
@@ -4677,39 +4688,38 @@ cron.schedule("0 7 * * 1", async () => {
   }
 });
 
-cron.schedule("0 * * * *", async () => {
+cron.schedule("* * * * *", async () => {
   try {
     const now = new Date();
-    const schedules = await NotifSchedule.find({ isActive: true });
+    const day = now.getUTCDay();
+    const hhmm = `${String(now.getUTCHours()).padStart(2, "0")}:${String(now.getUTCMinutes()).padStart(2, "0")}`;
+    const schedules = await NotifSchedule.find({ isActive: true }).lean();
     for (const sched of schedules) {
-      if (sched.schedule.hourUTC !== now.getUTCHours()) continue;
-      if (
-        sched.schedule.dayOfWeek !== undefined &&
-        sched.schedule.dayOfWeek !== now.getDay()
-      )
-        continue;
-      if (
-        sched.schedule.month !== undefined &&
-        sched.schedule.month !== now.getMonth() + 1
-      )
-        continue;
-      if (
-        sched.lastSent &&
-        new Date(sched.lastSent).toDateString() === now.toDateString()
-      )
-        continue;
-      await sendSystemNotification(
-        sched.title,
-        sched.message,
-        "reminder",
-        sched.targetGroup || null,
-      );
-      await NotifSchedule.findByIdAndUpdate(sched._id, { lastSent: now });
-      console.log(`✅ Sent scheduled reminder: ${sched.title}`);
+      const days = Array.isArray(sched.daysOfWeek) && sched.daysOfWeek.length
+        ? sched.daysOfWeek
+        : (sched.schedule?.dayOfWeek !== undefined ? [sched.schedule.dayOfWeek] : []);
+      const times = Array.isArray(sched.times) && sched.times.length
+        ? sched.times
+        : (sched.schedule?.hourUTC !== undefined ? [`${String(sched.schedule.hourUTC).padStart(2, "0")}:00`] : []);
+      if (!days.includes(day) || !times.includes(hhmm)) continue;
+      const sendKey = `${now.toISOString().slice(0, 10)}-${hhmm}`;
+      // Avoid duplicate sends if a hosting platform briefly runs overlapping workers.
+      if (sched.lastSentKey === sendKey) continue;
+      const notification = await Notification.create({
+        title: sched.title,
+        message: sched.message,
+        type: "reminder",
+        targetGroup: sched.targetScope === "group" ? sched.targetGroup : undefined,
+        targetBranch: sched.targetScope === "branch" ? sched.targetBranch : undefined,
+        sentBy: sched.createdBy,
+        sentByName: "MOR Reminder",
+        sentByRole: "System",
+      });
+      await sendPushForNotification(notification);
+      await NotifSchedule.findByIdAndUpdate(sched._id, { lastSent: now, lastSentKey: sendKey });
+      console.log(`✅ Sent reminder: ${sched.title} at ${hhmm}`);
     }
-  } catch (e) {
-    console.error("Cron reminder error:", e.message);
-  }
+  } catch (e) { console.error("Cron reminder error:", e.message); }
 });
 
 // ========== DATABASE INITIALIZATION ==========
@@ -4753,7 +4763,7 @@ async function initializeDatabase() {
         message:
           "Fellowship is today at 1 PM! Join us for worship, the Word, and fellowship together. Be there and be a blessing!",
         activityType: "fellowship",
-        schedule: { dayOfWeek: 6, weekPattern: "every", hourUTC: 9 },
+        daysOfWeek: [6], times: ["09:00"],
         isActive: true,
       },
       {
@@ -4761,7 +4771,7 @@ async function initializeDatabase() {
         message:
           "CBS Bible Study is tonight! Come and grow in the Word of God. Let nothing keep you away from studying God's Word.",
         activityType: "cbs",
-        schedule: { dayOfWeek: 2, weekPattern: "every", hourUTC: 14 },
+        daysOfWeek: [2], times: ["14:00"],
         isActive: true,
       },
       {
@@ -4769,7 +4779,7 @@ async function initializeDatabase() {
         message:
           "Evangelism is today! Let us go out and share the Good News. Souls are waiting! Be part of this great commission.",
         activityType: "evangelism",
-        schedule: { dayOfWeek: 5, weekPattern: "first", hourUTC: 14 },
+        daysOfWeek: [5], times: ["14:00"],
         isActive: true,
       },
     ];
