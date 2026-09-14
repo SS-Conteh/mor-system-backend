@@ -1171,6 +1171,7 @@ app.post("/api/auth/login", async (req, res) => {
           : "Your account is pending approval. Please wait for your shepherd before signing in.",
         pendingApproval: user.approvalStatus === "pending",
       });
+    const isFirstLogin = !user.lastLogin;
     const token = jwt.sign(
       { userId: user._id, role: user.role },
       process.env.JWT_SECRET,
@@ -1195,6 +1196,7 @@ app.post("/api/auth/login", async (req, res) => {
         isCBSLeader: user.isCBSLeader,
         assignedCBSLocation: user.assignedCBSLocation,
         isGroupLeader: user.isGroupLeader,
+        isFirstLogin,
       },
     });
   } catch (error) {
@@ -3599,7 +3601,7 @@ app.get("/api/notification-schedules", authMiddleware, async (req, res) => {
   } catch (error) { res.status(500).json({ error: "Server error" }); }
 });
 
-app.post("/api/notification-schedules", authMiddleware, roleMiddleware("Head Shepherd", "Branch Head Shepherd", "Group Leader", "System Admin"), async (req, res) => {
+app.post("/api/notification-schedules", authMiddleware, roleMiddleware("Head Shepherd", "Branch Head Shepherd", "Group Leader"), async (req, res) => {
   try {
     const schedData = normalizeReminderData(req.body, req.user);
     const s = await NotifSchedule.create({ ...schedData, createdBy: req.user._id });
@@ -3607,7 +3609,7 @@ app.post("/api/notification-schedules", authMiddleware, roleMiddleware("Head She
   } catch (error) { res.status(error.statusCode || 500).json({ error: error.message || "Server error" }); }
 });
 
-app.put("/api/notification-schedules/:id", authMiddleware, roleMiddleware("Head Shepherd", "Branch Head Shepherd", "Group Leader", "System Admin"), async (req, res) => {
+app.put("/api/notification-schedules/:id", authMiddleware, roleMiddleware("Head Shepherd", "Branch Head Shepherd", "Group Leader"), async (req, res) => {
   try {
     const s = await NotifSchedule.findById(req.params.id);
     if (!s) return res.status(404).json({ error: "Reminder not found" });
@@ -3618,7 +3620,7 @@ app.put("/api/notification-schedules/:id", authMiddleware, roleMiddleware("Head 
   } catch (error) { res.status(error.statusCode || 500).json({ error: error.message || "Server error" }); }
 });
 
-app.delete("/api/notification-schedules/:id", authMiddleware, roleMiddleware("Head Shepherd", "Branch Head Shepherd", "Group Leader", "System Admin"), async (req, res) => {
+app.delete("/api/notification-schedules/:id", authMiddleware, roleMiddleware("Head Shepherd", "Branch Head Shepherd", "Group Leader"), async (req, res) => {
   try {
     const s = await NotifSchedule.findById(req.params.id);
     if (!s) return res.status(404).json({ error: "Reminder not found" });
@@ -3712,9 +3714,11 @@ app.post("/api/notifications/read-all", authMiddleware, async (req, res) => {
   } catch (error) { res.status(500).json({ error: "Could not clear notification counter" }); }
 });
 
-app.post("/api/notifications", authMiddleware, async (req, res) => {
+app.post("/api/notifications", authMiddleware, roleMiddleware("Head Shepherd", "Branch Head Shepherd", "Group Leader"), async (req, res) => {
   try {
-    if (req.user.role === "Member") {
+    // Only Head Shepherds, Branch Head Shepherds, and Group Leaders may
+    // manually send notifications. Members cannot send notifications.
+    if (req.user.role === "Group Leader") {
       req.body.type = "group";
       req.body.targetGroup = req.user.group;
     }
