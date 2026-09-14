@@ -49,7 +49,7 @@ app.use(
     credentials: true,
   }),
 );
-app.use(express.json());
+app.use(express.json({ limit: "2mb" }));
 app.use(express.static(path.join(__dirname, "../frontend")));
 
 // ========== DATABASE MODELS ==========
@@ -389,6 +389,7 @@ const NotificationSchema = new mongoose.Schema({
   sentByName: String,
   sentByRole: String,
   readBy: [{ type: mongoose.Schema.Types.ObjectId, ref: "User" }],
+  deletedBy: [{ type: mongoose.Schema.Types.ObjectId, ref: "User" }],
   isUrgent: { type: Boolean, default: false },
   createdAt: { type: Date, default: Date.now },
 });
@@ -701,14 +702,40 @@ const roleMiddleware =
   };
 
 // ========== MULTER CONFIGURATION ==========
+// Profile photos: do not trust the browser/WhatsApp supplied MIME type.
+// WhatsApp and some mobile browsers may send valid images as application/octet-stream,
+// image/heic, or with an unusual filename. We inspect the actual file bytes below.
 const upload = multer({
   storage: multer.memoryStorage(),
-  limits: { fileSize: 10 * 1024 * 1024 },
-  fileFilter: (req, file, cb) => {
-    if (/jpeg|jpg|png|gif|webp/.test(file.mimetype)) return cb(null, true);
-    cb(new Error("Only image files are allowed"));
-  },
+  limits: { fileSize: 15 * 1024 * 1024 },
 });
+
+function detectImageType(buffer) {
+  if (!buffer || buffer.length < 4) return null;
+  const b = buffer;
+  if (b[0] === 0xff && b[1] === 0xd8 && b[2] === 0xff) return "jpeg";
+  if (b.length >= 8 && b[0] === 0x89 && b[1] === 0x50 && b[2] === 0x4e && b[3] === 0x47 && b[4] === 0x0d && b[5] === 0x0a && b[6] === 0x1a && b[7] === 0x0a) return "png";
+  if (b[0] === 0x47 && b[1] === 0x49 && b[2] === 0x46 && b[3] === 0x38) return "gif";
+  if (b[0] === 0x42 && b[1] === 0x4d) return "bmp";
+  if (b[0] === 0x49 && b[1] === 0x49 && b[2] === 0x2a && b[3] === 0x00) return "tiff";
+  if (b[0] === 0x4d && b[1] === 0x4d && b[2] === 0x00 && b[3] === 0x2a) return "tiff";
+  if (b.length >= 12 && b.toString("ascii", 0, 4) === "RIFF" && b.toString("ascii", 8, 12) === "WEBP") return "webp";
+  // HEIC/HEIF/AVIF are ISO-BMFF files. The brand is stored at byte 8.
+  if (b.length >= 12 && b.toString("ascii", 4, 8) === "ftyp") {
+    const brand = b.toString("ascii", 8, 12).toLowerCase();
+    if (["heic", "heix", "hevc", "hevx", "mif1", "msf1"].includes(brand)) return "heic";
+    if (["avif", "avis"].includes(brand)) return "avif";
+  }
+  return null;
+}
+
+function isAllowedProfileImage(file) {
+  if (!file || !file.buffer) return false;
+  const detected = detectImageType(file.buffer);
+  if (detected) return true;
+  const mime = String(file.mimetype || "").toLowerCase();
+  return mime.startsWith("image/") && !mime.includes("svg");
+}
 const mediaUpload = multer({
   storage: multer.memoryStorage(),
   limits: { fileSize: 100 * 1024 * 1024 },
@@ -850,6 +877,8 @@ async function backfillAbsentForNewMember(member) {
 
 function notificationIsForUser(notification, user) {
   const userId = user._id.toString();
+  // A deleted notification is hidden only from the account that deleted it.
+  if ((notification.deletedBy || []).some((id) => id?.toString() === userId)) return false;
   // Personal notifications always belong only to their intended recipient.
   // This includes account-approval notices and pending-approval requests.
   if (notification.type === "personal") return notification.targetUser?.toString() === userId;
@@ -868,7 +897,7 @@ async function sendPushForNotification(notification) {
     const subscriptions = await PushSubscription.find({ user: { $in: recipients.map((user) => user._id) } }).lean();
     await Promise.all(subscriptions.map(async (subscription) => {
       const recipient = recipients.find((user) => user._id.toString() === subscription.user.toString());
-      const unread = await Notification.find({ readBy: { $ne: recipient._id } }).sort({ createdAt: -1 }).limit(50).lean();
+      const unread = await Notification.find({ readBy: { $ne: recipient._id }, deletedBy: { $ne: recipient._id } }).sort({ createdAt: -1 }).limit(50).lean();
       const badgeCount = unread.filter((item) => notificationIsForUser(item, recipient)).length;
       const notificationPage = recipient.role === "Group Leader" ? "/group-leader.html" : recipient.role === "Branch Head Shepherd" ? "/branch.html" : "/member.html";
       try {
@@ -1089,17 +1118,22 @@ app.post("/api/auth/register", async (req, res) => {
     // sessions for their group/branch so records are complete from day one.
     backfillAbsentForNewMember(member);
 
-    // Send a device notification to the person responsible for approval.
-    // Leader applicants go to every Head Shepherd; all other members go to
-    // the Group Leader for the chosen branch and ministry group.
-    const approvers = selectedStatus === "Leader"
-      ? await User.find({ role: "Head Shepherd", approvalStatus: { $ne: "pending" } }).select("_id")
+    // Create a persistent notification for the Group Leader and also inform the Head Shepherd.
+    // The Group Leader's notification appears in their Notifications navigation as well as push.
+    const groupApprovers = selectedStatus === "Leader"
+      ? []
       : await User.find({ role: "Group Leader", branch, group, approvalStatus: { $ne: "pending" } }).select("_id");
-    const title = selectedStatus === "Leader" ? "⏳ Leader Approval Required" : "⏳ Member Approval Required";
-    const message = `${fullName} has signed up as ${selectedStatus === "Intense Leader" ? "Intense" : selectedStatus} in ${group} Group (${branch}) and is waiting for your approval.`;
-    await Promise.all(approvers.map((approver) =>
-      sendSystemNotification(title, message, "personal", null, approver._id),
-    ));
+    const headShepherds = await User.find({ role: "Head Shepherd", approvalStatus: { $ne: "pending" } }).select("_id");
+    const displayStatus = selectedStatus === "Intense Leader" ? "Intense" : selectedStatus;
+    const groupTitle = selectedStatus === "Leader" ? "⏳ Leader Approval Required" : "⏳ Member Approval Required";
+    const groupMessage = `${fullName} has signed up as ${displayStatus} in ${group} Group (${branch}) and is waiting for your approval.`;
+    const headMessage = selectedStatus === "Leader"
+      ? `${fullName} has signed up as ${displayStatus} in ${group} Group (${branch}) and is waiting for your approval.`
+      : `${fullName} has signed up as ${displayStatus} in ${group} Group (${branch}) and is waiting for the group leader's approval.`;
+    await Promise.all([
+      ...groupApprovers.map((approver) => sendSystemNotification(groupTitle, groupMessage, "personal", null, approver._id)),
+      ...headShepherds.map((approver) => sendSystemNotification("⏳ New Member Signup", headMessage, "personal", null, approver._id)),
+    ]);
     res.status(201).json({
       message: "Your account is pending approval. Please wait for your shepherd to approve it before signing in.",
       pendingApproval: true,
@@ -1213,6 +1247,22 @@ app.post(
         null,
         applicant._id,
       );
+
+      // Notify Head Shepherds that the member's account has been approved.
+      const headShepherds = await User.find({
+        role: "Head Shepherd",
+        approvalStatus: { $ne: "pending" },
+      }).select("_id");
+      const pronoun = String(applicant.gender || "").toLowerCase().startsWith("m") ? "He" : String(applicant.gender || "").toLowerCase().startsWith("f") ? "She" : "They";
+      await Promise.all(headShepherds.map((shepherd) =>
+        sendSystemNotification(
+          "✅ Member Account Approved",
+          `${applicant.fullName} MOR account has been approved by ${req.user.fullName}. ${pronoun} can now sign in and access the system.`,
+          "personal",
+          null,
+          shepherd._id,
+        ),
+      ));
       await logActivity(`approved ${applicant.fullName}'s membership`, req.user);
       res.json({ message: `${applicant.fullName} has been approved` });
     } catch (error) {
@@ -1234,28 +1284,55 @@ app.get("/api/auth/verify", authMiddleware, async (req, res) => {
 });
 
 // ========== PROFILE ROUTES ==========
+async function uploadProfilePhotoToCloudinary(file) {
+  if (!file) throw new Error("No image was uploaded");
+  if (!isAllowedProfileImage(file)) {
+    const err = new Error("Please upload a valid image (JPEG, PNG, GIF, WebP, HEIC/HEIF, AVIF, BMP or TIFF).");
+    err.statusCode = 400;
+    throw err;
+  }
+  return new Promise((resolve, reject) => {
+    const stream = cloudinary.uploader.upload_stream(
+      {
+        folder: "mor-system/profile-photos",
+        resource_type: "image",
+        transformation: [
+          { width: 500, height: 500, crop: "fill", gravity: "face" },
+        ],
+      },
+      (error, result) => {
+        if (error) return reject(error);
+        resolve(result.secure_url);
+      },
+    );
+    stream.end(file.buffer);
+  });
+}
+
+// Upload a photo without changing the currently authenticated user's profile.
+// Used when leaders are creating a new member and need the resulting URL first.
+app.post(
+  "/api/profile/photo/upload",
+  authMiddleware,
+  upload.single("photo"),
+  async (req, res) => {
+    try {
+      const photoUrl = await uploadProfilePhotoToCloudinary(req.file);
+      res.json({ photoUrl, message: "Image uploaded successfully" });
+    } catch (error) {
+      console.error("Profile image upload error:", error);
+      res.status(error.statusCode || 500).json({ error: error.message || "Image upload failed" });
+    }
+  },
+);
+
 app.post(
   "/api/profile/photo",
   authMiddleware,
   upload.single("photo"),
   async (req, res) => {
     try {
-      if (!req.file) return res.status(400).json({ error: "No file uploaded" });
-      const photoUrl = await new Promise((resolve, reject) => {
-        const stream = cloudinary.uploader.upload_stream(
-          {
-            folder: "mor-system/profile-photos",
-            transformation: [
-              { width: 500, height: 500, crop: "fill", gravity: "face" },
-            ],
-          },
-          (error, result) => {
-            if (error) return reject(error);
-            resolve(result.secure_url);
-          },
-        );
-        stream.end(req.file.buffer);
-      });
+      const photoUrl = await uploadProfilePhotoToCloudinary(req.file);
       await User.findByIdAndUpdate(req.user._id, { profilePhoto: photoUrl });
       await Member.findOneAndUpdate(
         { phoneNumber: req.user.phoneNumber },
@@ -1263,7 +1340,8 @@ app.post(
       );
       res.json({ photoUrl, message: "Profile photo updated successfully" });
     } catch (error) {
-      res.status(500).json({ error: "Server error" });
+      console.error("Profile photo update error:", error);
+      res.status(error.statusCode || 500).json({ error: error.message || "Profile photo update failed" });
     }
   },
 );
@@ -3580,6 +3658,7 @@ app.get("/api/notifications", authMiddleware, async (req, res) => {
           { type: "general" },
           { type: "reminder" },
           { type: "group", targetGroup: req.user.group },
+          { type: "personal", targetUser: req.user._id },
           { type: "report" },
         ],
       };
@@ -3599,6 +3678,8 @@ app.get("/api/notifications", authMiddleware, async (req, res) => {
         ],
       };
     }
+    // A notification deleted by this account is hidden only for this account.
+    query = { $and: [query, { deletedBy: { $ne: req.user._id } }] };
     const notifications = await Notification.find(query)
       .sort({ createdAt: -1 })
       .limit(50);
@@ -3662,15 +3743,13 @@ app.delete("/api/notifications/:id", authMiddleware, async (req, res) => {
   try {
     const n = await Notification.findById(req.params.id);
     if (!n) return res.status(404).json({ error: "Notification not found" });
-    if (
-      n.sentBy?.toString() !== req.user._id.toString() &&
-      !["Head Shepherd", "System Admin"].includes(req.user.role)
-    )
-      return res
-        .status(403)
-        .json({ error: "You can only delete your own notifications" });
-    await Notification.findByIdAndDelete(req.params.id);
-    res.json({ message: "Notification deleted" });
+    // Deleting is personal: never remove the shared notification document.
+    // The notification is simply hidden from the requesting account.
+    await Notification.updateOne(
+      { _id: n._id },
+      { $addToSet: { deletedBy: req.user._id } },
+    );
+    res.json({ message: "Notification deleted from your account" });
   } catch (error) {
     res.status(500).json({ error: "Server error" });
   }
@@ -5241,6 +5320,22 @@ app.get(
     }
   },
 );
+
+// Always return JSON for upload/parser errors. Express otherwise emits an HTML error page,
+// which makes frontend response.json() fail with: Unexpected token '<'.
+app.use((err, req, res, next) => {
+  if (err instanceof multer.MulterError) {
+    const message = err.code === "LIMIT_FILE_SIZE"
+      ? "Image is too large. Please choose an image smaller than 15 MB."
+      : err.message || "Image upload failed";
+    return res.status(400).json({ error: message });
+  }
+  if (err) {
+    console.error("Unhandled request error:", err);
+    return res.status(err.statusCode || 500).json({ error: err.message || "Server error" });
+  }
+  next();
+});
 
 const PORT = process.env.PORT || 5000;
 app.listen(PORT, "0.0.0.0", () => {
