@@ -53,6 +53,7 @@ app.use(
       "http://localhost:5000",
       "https://mor-fellowship.vercel.app",
       "https://mor-fellowship-b4uxf9zsy-ss-conteh.vercel.app",
+      "https://mor-system.vercel.app",
       "http://localhost",
       "capacitor://localhost",
     ],
