@@ -44,19 +44,28 @@ if (
 // ========== MIDDLEWARE ==========
 // Gzip/brotli compress all responses — reduces payload size 60-80% for JSON
 app.use(compression());
+const allowedOrigins = new Set([
+  "http://localhost:3000",
+  "http://127.0.0.1:5500",
+  "http://localhost:5500",
+  "http://localhost:5000",
+  "https://mor-fellowship.vercel.app",
+  "https://mor-fellowship-55j173cki-ss-conteh.vercel.app",
+  "http://localhost",
+  "capacitor://localhost",
+  ...(process.env.FRONTEND_URL
+    ? [process.env.FRONTEND_URL.replace(/\/$/, "")]
+    : []),
+]);
+
 app.use(
   cors({
-    origin: [
-      "http://localhost:3000",
-      "http://127.0.0.1:5500",
-      "http://localhost:5500",
-      "http://localhost:5000",
-      "https://mor-fellowship.vercel.app",
-      "https://mor-fellowship-b4uxf9zsy-ss-conteh.vercel.app",
-      "https://mor-system.vercel.app",
-      "http://localhost",
-      "capacitor://localhost",
-    ],
+    origin(origin, callback) {
+      // Non-browser requests (health checks, curl, server-to-server) have no Origin.
+      if (!origin || allowedOrigins.has(origin.replace(/\/$/, "")))
+        return callback(null, true);
+      return callback(new Error("CORS origin not allowed"));
+    },
     credentials: true,
   }),
 );
@@ -929,16 +938,12 @@ async function backfillAbsentForNewMember(member) {
 
 function notificationIsForUser(notification, user) {
   const userId = user._id.toString();
-  // A deleted notification is hidden only from the account that deleted it.
   if ((notification.deletedBy || []).some((id) => id?.toString() === userId))
     return false;
-  // Personal notifications always belong only to their intended recipient.
-  // This includes account-approval notices and pending-approval requests.
+
   if (notification.type === "personal")
     return notification.targetUser?.toString() === userId;
-  // Scheduled reminders are delivered to members only, and are scoped by the
-  // reminder's target group/branch. This prevents one leader's reminders from
-  // leaking into other groups or branches.
+
   if (notification.type === "reminder") {
     if (user.role !== "Member") return false;
     if (notification.targetGroup)
@@ -947,22 +952,44 @@ function notificationIsForUser(notification, user) {
       return notification.targetBranch === user.branch;
     return true;
   }
+
   if (["Head Shepherd", "System Admin"].includes(user.role)) return true;
-  if (user.role === "Member")
+
+  if (user.role === "Member") {
     return (
-      ["general"].includes(notification.type) ||
+      notification.type === "general" ||
       (notification.type === "group" && notification.targetGroup === user.group)
     );
-  if (user.role === "Group Leader")
+  }
+
+  // Group Leaders must only receive notifications for their own group.
+  // In particular, inconsistency reports are group-scoped and must never
+  // leak from another group.
+  if (user.role === "Group Leader") {
     return (
-      ["general", "report"].includes(notification.type) ||
-      (notification.type === "group" && notification.targetGroup === user.group)
+      notification.type === "general" ||
+      (notification.type === "group" &&
+        notification.targetGroup === user.group) ||
+      (notification.type === "report" &&
+        notification.targetGroup === user.group) ||
+      (notification.type === "personal" &&
+        notification.targetUser?.toString() === userId)
     );
-  if (user.role === "Branch Head Shepherd")
-    return (
-      notification.targetBranch === user.branch ||
-      (notification.type === "group" && notification.targetGroup === user.group)
+  }
+
+  // Branch Shepherds receive branch-wide notifications and group/report
+  // notifications only when the target group belongs to their branch.
+  if (user.role === "Branch Head Shepherd") {
+    return Boolean(
+      (notification.targetBranch &&
+        notification.targetBranch === user.branch) ||
+      ((notification.type === "group" || notification.type === "report") &&
+        notification.targetGroup &&
+        notification.targetBranch === user.branch) ||
+      (notification.type === "personal" &&
+        notification.targetUser?.toString() === userId),
     );
+  }
   return false;
 }
 
@@ -1000,10 +1027,12 @@ async function sendPushForNotification(notification) {
         ).length;
         const notificationPage =
           recipient.role === "Group Leader"
-            ? "/group-leader.html"
+            ? "/group-leader"
             : recipient.role === "Branch Head Shepherd"
-              ? "/branch.html"
-              : "/member.html";
+              ? "/branch"
+              : ["Head Shepherd", "System Admin"].includes(recipient.role)
+                ? "/"
+                : "/member";
         try {
           await webpush.sendNotification(
             { endpoint: subscription.endpoint, keys: subscription.keys },
@@ -1034,6 +1063,7 @@ async function sendSystemNotification(
   type = "general",
   targetGroup = null,
   targetUser = null,
+  targetBranch = null,
 ) {
   try {
     const notification = await Notification.create({
@@ -1042,6 +1072,7 @@ async function sendSystemNotification(
       type,
       targetGroup: targetGroup || undefined,
       targetUser: targetUser || undefined,
+      targetBranch: targetBranch || undefined,
       sentByName: "MOR System",
       sentByRole: "System",
     });
@@ -3218,7 +3249,7 @@ app.post(
       }
       const existing = await QRSession.findOne(existingQueryBase);
       if (existing) {
-        const qrUrl = `${process.env.FRONTEND_URL || "https://mor-system-app.vercel.app"}/qr-scan.html?token=${existing.token}`;
+        const qrUrl = `${process.env.FRONTEND_URL || "https://mor-fellowship.vercel.app"}/qr-scan?token=${existing.token}`;
         return res.json({
           token: existing.token,
           qrUrl,
@@ -3247,7 +3278,7 @@ app.post(
         isActive: true,
       });
       await session.save();
-      const qrUrl = `${process.env.FRONTEND_URL || "https://mor-system-app.vercel.app"}/qr-scan.html?token=${token}`;
+      const qrUrl = `${process.env.FRONTEND_URL || "https://mor-fellowship.vercel.app"}/qr-scan?token=${token}`;
       res.status(201).json({ token, qrUrl, session });
     } catch (error) {
       res.status(500).json({ error: "Server error" });
@@ -3951,57 +3982,28 @@ app.post("/api/push/subscribe", authMiddleware, async (req, res) => {
 
 app.get("/api/notifications", authMiddleware, async (req, res) => {
   try {
-    let query = {};
-    if (req.user.role === "Member") {
-      query = {
-        $or: [
-          { type: "general" },
-          { type: "reminder", targetGroup: req.user.group },
-          { type: "reminder", targetBranch: req.user.branch },
-          {
-            type: "reminder",
-            targetGroup: { $exists: false },
-            targetBranch: { $exists: false },
-          },
-          { type: "group", targetGroup: req.user.group },
-          { type: "personal", targetUser: req.user._id },
-        ],
-      };
-    } else if (req.user.role === "Group Leader") {
-      query = {
-        $or: [
-          { type: "general" },
-          { type: "group", targetGroup: req.user.group },
-          { type: "personal", targetUser: req.user._id },
-          { type: "report" },
-        ],
-      };
-    } else if (req.user.role === "Branch Head Shepherd" && req.user.branch) {
-      // Only see notifications relevant to their branch
-      const branchGroups = await Group.find({ branch: req.user.branch }).select(
-        "name",
-      );
-      const groupNames = branchGroups.map((g) => g.name);
-      query = {
-        $or: [
-          { targetBranch: req.user.branch },
-          { type: "group", targetGroup: { $in: groupNames } },
-          { sentBy: req.user._id },
-        ],
-      };
-    }
-    // A notification deleted by this account is hidden only for this account.
-    query = { $and: [query, { deletedBy: { $ne: req.user._id } }] };
-    const notifications = await Notification.find(query)
+    // Keep the role-scope rules in one place so the in-app list and push
+    // delivery always agree about who may receive a notification.
+    const candidates = await Notification.find({
+      deletedBy: { $ne: req.user._id },
+    })
       .sort({ createdAt: -1 })
-      .limit(50);
-    res.json(
-      notifications.map((n) => ({
-        ...n.toObject(),
-        isRead: n.readBy.includes(req.user._id),
-      })),
-    );
+      .limit(200)
+      .lean();
+
+    const notifications = candidates
+      .filter((notification) => notificationIsForUser(notification, req.user))
+      .slice(0, 50)
+      .map((n) => ({
+        ...n,
+        isRead: (n.readBy || []).some(
+          (id) => id?.toString() === req.user._id.toString(),
+        ),
+      }));
+
+    res.json(notifications);
   } catch (error) {
+    console.error("Notification list error:", error.message);
     res.status(500).json({ error: "Server error" });
   }
 });
@@ -4068,12 +4070,56 @@ app.post("/api/notifications/:id/read", authMiddleware, async (req, res) => {
     res.status(500).json({ error: "Server error" });
   }
 });
+// Clear is deliberately separate from individual deletion.
+// Head Shepherd/System Admin: permanently clear the notification collection.
+// Branch Shepherd: permanently clear only notifications belonging to their branch.
+app.delete("/api/notifications/clear", authMiddleware, async (req, res) => {
+  try {
+    if (["Head Shepherd", "System Admin"].includes(req.user.role)) {
+      const result = await Notification.deleteMany({});
+      return res.json({
+        message: "All notifications cleared",
+        deleted: result.deletedCount || 0,
+      });
+    }
+
+    if (req.user.role === "Branch Head Shepherd" && req.user.branch) {
+      const branchGroups = await Group.find({ branch: req.user.branch })
+        .select("name")
+        .lean();
+      const groupNames = branchGroups.map((g) => g.name);
+      const result = await Notification.deleteMany({
+        $or: [
+          { targetBranch: req.user.branch },
+          { targetGroup: { $in: groupNames } },
+        ],
+      });
+      return res.json({
+        message: "Branch notifications cleared",
+        deleted: result.deletedCount || 0,
+      });
+    }
+
+    return res
+      .status(403)
+      .json({ error: "You do not have permission to clear notifications" });
+  } catch (error) {
+    console.error("Clear notifications error:", error.message);
+    res.status(500).json({ error: "Could not clear notifications" });
+  }
+});
+
 app.delete("/api/notifications/:id", authMiddleware, async (req, res) => {
   try {
     const n = await Notification.findById(req.params.id);
     if (!n) return res.status(404).json({ error: "Notification not found" });
-    // Deleting is personal: never remove the shared notification document.
-    // The notification is simply hidden from the requesting account.
+    if (!notificationIsForUser(n, req.user))
+      return res
+        .status(403)
+        .json({ error: "You cannot delete this notification" });
+
+    // Individual deletion is always personal. Even Head/Branch Shepherds do
+    // not remove the shared record unless they explicitly use Clear.
     await Notification.updateOne(
       { _id: n._id },
       { $addToSet: { deletedBy: req.user._id } },
@@ -4997,6 +5043,8 @@ cron.schedule("0 7 * * 1", async () => {
           `${inconsistent.length} member(s) in ${group.name} group have inconsistent attendance.`,
           "report",
           group.name,
+          null,
+          group.branch || null,
         );
       }
     }
